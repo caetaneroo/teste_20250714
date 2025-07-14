@@ -1,0 +1,280 @@
+import asyncio
+import time
+import logging
+import statistics
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional, List
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
+
+# Fuso horário de referência para os relatórios.
+# Usar a base de dados IANA ('America/Sao_Paulo') é a prática recomendada.
+BR_TIMEZONE = ZoneInfo("America/Sao_Paulo")
+
+@dataclass
+class StatsContainer:
+    """
+    Um contêiner de dados robusto e otimizado para armazenar e calcular métricas
+    de desempenho, com timestamps formatados e insights de paralelização.
+    """
+    # --- Identificação e Tempo ---
+    id: str
+    start_time: float = field(default_factory=time.time)
+    end_time: Optional[float] = None
+
+    # --- Contadores de Requisição ---
+    total_requests: int = 0
+    successful_requests: int = 0
+    failed_requests: int = 0
+    error_type_counts: Counter = field(default_factory=Counter)
+    total_retry_count: int = 0
+
+    # --- Contadores de Tokens e Custo ---
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cached_tokens: int = 0
+    total_cost: float = 0.0
+
+    # --- Rastreamento de Latência ---
+    api_response_times: List[float] = field(default_factory=list)
+
+    # --- Rastreamento de Concorrência ---
+    current_concurrent_requests: int = 0
+    concurrent_peak: int = 0
+
+    # --- Métricas de Rate Limiter ---
+    api_rate_limits_detected: int = 0
+    proactive_pauses: int = 0
+    total_proactive_wait_time: float = 0.0
+    peak_tpm: int = 0
+    
+    # --- Propriedades Calculadas ---
+    @property
+    def processing_time(self) -> float:
+        """Tempo real decorrido do início ao fim (tempo de relógio)."""
+        if self.end_time:
+            return self.end_time - self.start_time
+        return time.time() - self.start_time
+
+    @property
+    def total_api_time(self) -> float:
+        """Soma de todos os tempos de resposta da API (tempo se fossem sequenciais)."""
+        return sum(self.api_response_times)
+
+    @property
+    def parallelization_gain_seconds(self) -> float:
+        """Calcula a economia de tempo em segundos obtida com a paralelização."""
+        processing_time = self.processing_time
+        if processing_time > 0 and self.total_api_time > processing_time:
+            return self.total_api_time - processing_time
+        return 0.0
+
+    @property
+    def parallelization_gain_percent(self) -> float:
+        """Calcula a economia de tempo em porcentagem."""
+        if self.total_api_time > 0:
+            gain_seconds = self.parallelization_gain_seconds
+            return (gain_seconds / self.total_api_time) * 100
+        return 0.0
+        
+    @property
+    def min_api_latency(self) -> float:
+        return min(self.api_response_times) if self.api_response_times else 0
+
+    @property
+    def max_api_latency(self) -> float:
+        return max(self.api_response_times) if self.api_response_times else 0
+
+    @property
+    def avg_api_latency(self) -> float:
+        return statistics.mean(self.api_response_times) if self.api_response_times else 0
+
+    @property
+    def requests_per_second(self) -> float:
+        """Calcula a taxa de requisições por segundo (throughput)."""
+        processing_time = self.processing_time
+        if processing_time > 0:
+            return self.total_requests / processing_time
+        return 0.0
+
+    # --- Propriedades para Timestamps Formatados com Milissegundos ---
+    @staticmethod
+    def _format_timestamp(timestamp: Optional[float]) -> str:
+        """Converte um timestamp Unix para uma string formatada com milissegundos."""
+        if not timestamp:
+            return "N/A"
+        dt_object = datetime.fromtimestamp(timestamp, tz=BR_TIMEZONE)
+        return dt_object.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] # Formata e trunca para 3 casas decimais
+
+    @property
+    def start_time_formatted(self) -> str:
+        """Retorna o timestamp de início formatado."""
+        return self._format_timestamp(self.start_time)
+
+    @property
+    def end_time_formatted(self) -> str:
+        """Retorna o timestamp de fim formatado."""
+        return self._format_timestamp(self.end_time)
+
+
+class StatsManager:
+    """
+    Gerenciador centralizado para coletar, agregar e apresentar estatísticas de
+    performance de forma assíncrona e segura, com suporte a múltiplos lotes.
+    """
+
+    def __init__(self, max_tpm: int):
+        self.max_tpm = max_tpm
+        self._global_stats = StatsContainer(id="global")
+        self._batch_stats: Dict[str, StatsContainer] = {}
+        self._lock = asyncio.Lock()
+        logger.info("StatsManager inicializado e pronto para gerar insights.")
+
+    async def _update_stats(self, stats: StatsContainer, **kwargs):
+        """Função interna para atualizar um container de estatísticas com dados de uma requisição."""
+        stats.total_requests += 1
+        if kwargs.get('success', False):
+            stats.successful_requests += 1
+            # **CORREÇÃO:** O custo só é adicionado em caso de sucesso.
+            stats.total_cost += kwargs.get('cost', 0.0)
+            stats.total_input_tokens += kwargs.get('input_tokens', 0)
+            stats.total_output_tokens += kwargs.get('output_tokens', 0)
+            stats.total_cached_tokens += kwargs.get('cached_tokens', 0)
+        else:
+            stats.failed_requests += 1
+            stats.error_type_counts[kwargs.get('error_type', 'UnknownError')] += 1
+        
+        if (api_time := kwargs.get('api_response_time', 0.0)) > 0:
+            stats.api_response_times.append(api_time)
+        stats.total_retry_count += kwargs.get('retry_count', 0)
+
+    async def record_request(self, batch_id: Optional[str] = None, **kwargs):
+        """Registra os dados de uma única requisição, atualizando as estatísticas globais e do lote."""
+        async with self._lock:
+            await self._update_stats(self._global_stats, **kwargs)
+            if batch_id and batch_id in self._batch_stats:
+                await self._update_stats(self._batch_stats[batch_id], **kwargs)
+
+    async def record_rate_limiter_event(self, event: Dict[str, Any], batch_id: Optional[str] = None):
+        """Registra eventos do RateLimiter, como pausas e detecção de limites."""
+        event_type = event.get('event_type')
+        async with self._lock:
+            # **CORREÇÃO:** O `_get_relevant_containers` garante que a métrica
+            # seja aplicada tanto no global quanto no lote específico.
+            for stats in self._get_relevant_containers(batch_id):
+                if event_type == 'proactive_pause':
+                    stats.proactive_pauses += 1
+                    stats.total_proactive_wait_time += event.get('wait_time', 0.0)
+                elif event_type == 'api_rate_limit_detected':
+                     stats.api_rate_limits_detected += 1
+                elif event_type == 'token_usage_update':
+                    current_tpm = event.get('current_tpm', 0)
+                    if current_tpm > stats.peak_tpm:
+                        stats.peak_tpm = current_tpm
+    
+    async def record_concurrent_start(self, batch_id: Optional[str] = None):
+        """Registra o início de uma requisição para rastrear o pico de concorrência."""
+        async with self._lock:
+            for stats in self._get_relevant_containers(batch_id):
+                stats.current_concurrent_requests += 1
+                if stats.current_concurrent_requests > stats.concurrent_peak:
+                    stats.concurrent_peak = stats.current_concurrent_requests
+
+    async def record_concurrent_end(self, batch_id: Optional[str] = None):
+        """Registra o fim de uma requisição."""
+        async with self._lock:
+            for stats in self._get_relevant_containers(batch_id):
+                stats.current_concurrent_requests -= 1
+
+    def _get_relevant_containers(self, batch_id: Optional[str]) -> List[StatsContainer]:
+        """Retorna uma lista de containers de estatísticas relevantes (global e, se houver, do lote)."""
+        containers = [self._global_stats]
+        if batch_id and batch_id in self._batch_stats:
+            containers.append(self._batch_stats[batch_id])
+        return containers
+
+    def start_batch(self, batch_id: str):
+        """Inicia um novo container de estatísticas para um lote específico."""
+        if batch_id in self._batch_stats:
+            logger.warning(f"Batch com ID '{batch_id}' já existe. Sobrescrevendo estatísticas.")
+        self._batch_stats[batch_id] = StatsContainer(id=batch_id)
+        logger.info(f"Lote de estatísticas '{batch_id}' iniciado.")
+
+    def end_batch(self, batch_id: str) -> Optional[StatsContainer]:
+        """Finaliza a coleta para um lote, registrando seu tempo de término."""
+        if batch_stats := self._batch_stats.get(batch_id):
+            batch_stats.end_time = time.time()
+            return batch_stats
+        return None
+
+    def get_global_stats(self) -> StatsContainer:
+        """Retorna o objeto de estatísticas globais."""
+        return self._global_stats
+
+    def _format_stats(self, stats: StatsContainer, title: str) -> str:
+        """Formata um contêiner de estatísticas em um relatório legível e rico em insights."""
+        header = f" RELATÓRIO DE PERFORMANCE: {title.upper()} ".center(80, "=")
+        
+        summary = (
+            f"📊 RESUMO GERAL:\n"
+            f"   - Requisições: {stats.total_requests} (✅ {stats.successful_requests} Sucesso | ❌ {stats.failed_requests} Falhas)\n"
+            f"   - Início: {stats.start_time_formatted}\n"
+            f"   - Fim:    {stats.end_time_formatted}\n"
+            f"   - Duração: {stats.processing_time:.3f}s\n"
+        )
+        
+        # A seção de paralelização só faz sentido se houver mais de uma requisição.
+        parallelization = ""
+        if stats.total_requests > 1:
+            parallelization = (
+                f"🚀 EFICIÊNCIA DA PARALELIZAÇÃO:\n"
+                f"   - Tempo Total de API (Serial): {stats.total_api_time:.3f}s\n"
+                f"   - Ganho com Paralelização: {stats.parallelization_gain_seconds:.3f}s ({stats.parallelization_gain_percent:.1f}% de economia de tempo)\n"
+                f"   - Vazão (Throughput): {stats.requests_per_second:.2f} reqs/s\n"
+            )
+
+        # Evita divisão por zero se max_tpm não for definido.
+        tpm_usage_percent = (stats.peak_tpm / self.max_tpm * 100) if self.max_tpm > 0 else 0
+        performance = (
+            f"⏱️ DESEMPENHO E LATÊNCIA:\n"
+            f"   - Latência API (min/média/max): {stats.min_api_latency:.3f}s / {stats.avg_api_latency:.3f}s / {stats.max_api_latency:.3f}s\n"
+            f"   - Pico de Concorrência (Real): {stats.concurrent_peak} requisições\n"
+            f"   - Pico de Consumo TPM: {stats.peak_tpm:,} / {self.max_tpm:,} ({tpm_usage_percent:.1f}% do limite)\n"
+        )
+
+        total_tokens = stats.total_input_tokens + stats.total_output_tokens
+        cost_consumption = (
+            f"💰 CUSTO E CONSUMO DE TOKENS:\n"
+            f"   - Custo Total Estimado: ${stats.total_cost:.4f}\n"
+            f"   - Tokens Totais: {total_tokens:,} (Input: {stats.total_input_tokens:,}, Output: {stats.total_output_tokens:,}, Cache: {stats.total_cached_tokens:,})\n"
+        )
+
+        reliability = (
+            f"🛡️ CONFIABILIDADE E RATE LIMITER:\n"
+            f"   - Retries Totais: {stats.total_retry_count}\n"
+            f"   - Erros de Rate Limit da API: {stats.api_rate_limits_detected}\n"
+            f"   - Pausas Proativas: {stats.proactive_pauses} (totalizando {stats.total_proactive_wait_time:.3f}s)\n"
+        )
+
+        footer = "=" * 80
+        
+        return (f"\n{header}\n{summary}\n{parallelization}\n{performance}\n{cost_consumption}\n{reliability}\n{footer}\n")
+
+    def get_summary(self, batch_id: Optional[str] = None) -> str:
+        """
+        Retorna uma string formatada com o resumo completo das estatísticas
+        para um lote específico ou para as estatísticas globais.
+        """
+        title = "GLOBAL"
+        if batch_id:
+            stats_obj = self._batch_stats.get(batch_id)
+            title = f"LOTE '{batch_id}'"
+            if not stats_obj:
+                return f"Erro: Nenhuma estatística encontrada para o lote com ID '{batch_id}'."
+        else:
+            stats_obj = self._global_stats
+        
+        return self._format_stats(stats_obj, title)
