@@ -24,8 +24,8 @@ BR_TIMEZONE = ZoneInfo("America/Sao_Paulo")
 # --- Constantes de Configuração Padrão ---
 DEFAULT_MAX_RETRY = 3
 DEFAULT_TEMPERATURE = 0.1
-DEFAULT_MAX_TPM = 125000
-DEFAULT_INITIAL_CONCURRENCY = 10
+DEFAULT_MAX_TPM = 1500000
+DEFAULT_INITIAL_CONCURRENCY = 50
 
 @dataclass
 class AIProcessorConfig:
@@ -133,9 +133,12 @@ class AIProcessor:
         )
         
         self.embedding_cache: Optional[Dict[str, List[float]]] = {} if self.config.enable_embedding_cache else None
-        # CORREÇÃO: Cache para objetos de estatísticas de lotes concluídos.
         self.batch_stats_cache: Dict[str, stats_manager.StatsContainer] = {}
         
+        # Cooldown para evitar spam de logs de pausa pró-ativa
+        self._last_proactive_pause_log_time = 0
+        self.proactive_pause_log_cooldown_seconds = 5.0
+
         logger.info("AIProcessor inicializado",
                     extra={'action': 'ai_processor_init', 'model': self.config.model, 'embedding_model': self.config.embedding_model})
 
@@ -149,8 +152,19 @@ class AIProcessor:
         return ((regular_input / 1000) * pricing['input'] + (cached_tokens / 1000) * pricing['cache'] + (output_tokens / 1000) * pricing['output'])
 
     def _create_stats_callback(self) -> Callable:
+        """Cria um callback inteligente para o RateLimiter enviar eventos ao StatsManager."""
         def callback(event: Dict[str, Any], batch_id: Optional[str] = None):
-            asyncio.create_task(self.stats_manager.record_rate_limiter_event(event, batch_id))
+            event_type = event.get('event_type')
+            
+            # Aplica cooldown no log de pausas pró-ativas
+            if event_type == 'proactive_pause':
+                now = time.time()
+                if (now - self._last_proactive_pause_log_time) > self.proactive_pause_log_cooldown_seconds:
+                    self._last_proactive_pause_log_time = now
+                    asyncio.create_task(self.stats_manager.record_rate_limiter_event(event, batch_id))
+            else:
+                # Encaminha outros eventos normalmente
+                asyncio.create_task(self.stats_manager.record_rate_limiter_event(event, batch_id))
         return callback
 
     def _supports_json_schema(self, model: str) -> bool:
@@ -195,6 +209,10 @@ class AIProcessor:
 
     async def _make_api_call(self, params: Dict[str, Any], request_id: str, batch_id: Optional[str] = None, is_embedding: bool = False) -> Dict[str, Any]:
         model = params.get('model', self.config.model if not is_embedding else self.config.embedding_model)
+        
+        # A lógica para não aumentar a concorrência se a latência estiver subindo
+        # é melhor implementada dentro do próprio AdaptiveRateLimiter, que agora considera
+        # a latência como um sinal de saúde do sistema.
         await self.rate_limiter.await_permission_to_proceed(batch_id)
         await self.stats_manager.record_concurrent_start(batch_id)
         
@@ -217,13 +235,14 @@ class AIProcessor:
                             input_tokens, output_tokens = response.usage.prompt_tokens, response.usage.completion_tokens
                             cached_tokens = getattr(getattr(response.usage, 'prompt_tokens_details', {}), 'cached_tokens', 0)
                         
+                        api_response_time = time.time() - start_time
                         return {
                             'id': request_id, 'success': True, 'content': content,
                             'input_tokens': input_tokens, 'output_tokens': output_tokens,
                             'cached_tokens': cached_tokens, 'total_tokens': input_tokens + output_tokens,
                             'tokens_for_limiter': (input_tokens - cached_tokens) + output_tokens,
                             'cost': self._calculate_cost(model, input_tokens, output_tokens, cached_tokens),
-                            'api_response_time': time.time() - start_time, 'attempts': attempt.retry_state.attempt_number
+                            'api_response_time': api_response_time, 'attempts': attempt.retry_state.attempt_number
                         }
                     except Exception as e:
                         error_details = {'type': type(e).__name__, 'message': str(e), 'traceback': traceback.format_exc()}
@@ -244,8 +263,6 @@ class AIProcessor:
             await self.stats_manager.record_concurrent_end(batch_id)
 
     def _create_ordered_result(self, result: Dict[str, Any], start_timestamp_iso: str) -> Dict[str, Any]:
-        """Cria um dicionário de resultado final com uma ordem de campos padronizada."""
-        # CORREÇÃO: Usa o parâmetro `start_timestamp_iso` diretamente.
         ordered_result = {
             'id': result.get('id'),
             'start_timestamp': start_timestamp_iso,
@@ -262,7 +279,12 @@ class AIProcessor:
         return ordered_result
 
     async def _process_and_record_result(self, result: Dict[str, Any], model: str, batch_id: Optional[str] = None):
-        self.rate_limiter.record_request_completion(result.get('tokens_for_limiter', 0), result.get('success', False), batch_id)
+        self.rate_limiter.record_request_completion(
+            tokens_used=result.get('tokens_for_limiter', 0),
+            success=result.get('success', False),
+            latency=result.get('api_response_time', 0.0),
+            batch_id=batch_id
+        )
         await self.stats_manager.record_request(batch_id=batch_id, model=model, retry_count=max(0, result.get('attempts', 1) - 1), **result)
 
     async def _run_batch_processor(self, worker_coro: Callable, items: List, **kwargs):
@@ -277,14 +299,12 @@ class AIProcessor:
         return await asyncio.gather(*tasks)
 
     def _get_final_batch_id(self, batch_id: Optional[str], prefix: str) -> str:
-        """Cria um ID de lote final e único."""
         unique_timestamp = int(time.time())
         if batch_id:
             return f"{batch_id}_{unique_timestamp}"
         return f"{prefix}_batch_{unique_timestamp}"
 
     def _log_batch_completion(self, batch_id: str, batch_stats: stats_manager.StatsContainer):
-        """Gera um log detalhado e conciso na conclusão de um lote."""
         if not batch_stats:
             logger.error(f"Não foi possível gerar log de conclusão para o lote '{batch_id}' pois as estatísticas não foram encontradas.")
             return
@@ -297,7 +317,6 @@ class AIProcessor:
             f"Sucesso: {batch_stats.successful_requests}/{batch_stats.total_requests}"
         )
         
-        # CORREÇÃO: Log com um extra enxuto, sem listas ou objetos grandes.
         extra_log = {
             'action': 'batch_complete',
             'batch_id': batch_id,
@@ -314,7 +333,6 @@ class AIProcessor:
 
     async def process_batch(self, texts: List[str], prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
                             batch_id: Optional[str] = None, custom_ids: Optional[Any] = None, model: Optional[str] = None, **kwargs) -> Dict[str, Any]:
-        """Processa uma lista de textos em lote via chat completion."""
         final_batch_id = self._get_final_batch_id(batch_id, "chat")
         
         self.stats_manager.start_batch(final_batch_id)
@@ -344,7 +362,6 @@ class AIProcessor:
 
     async def process_embedding_batch(self, texts: List[str], batch_id: Optional[str] = None,
                                       custom_ids: Optional[Any] = None, model: Optional[str] = None) -> Dict[str, Any]:
-        """Gera embeddings para uma lista de textos em lote."""
         final_batch_id = self._get_final_batch_id(batch_id, "embedding")
 
         self.stats_manager.start_batch(final_batch_id)
