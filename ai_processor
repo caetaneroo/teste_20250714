@@ -133,6 +133,8 @@ class AIProcessor:
         )
         
         self.embedding_cache: Optional[Dict[str, List[float]]] = {} if self.config.enable_embedding_cache else None
+        # CORREÇÃO: Cache para objetos de estatísticas de lotes concluídos.
+        self.batch_stats_cache: Dict[str, stats_manager.StatsContainer] = {}
         
         logger.info("AIProcessor inicializado",
                     extra={'action': 'ai_processor_init', 'model': self.config.model, 'embedding_model': self.config.embedding_model})
@@ -242,8 +244,15 @@ class AIProcessor:
             await self.stats_manager.record_concurrent_end(batch_id)
 
     def _create_ordered_result(self, result: Dict[str, Any], start_timestamp_iso: str) -> Dict[str, Any]:
-        base_fields = ['id', 'start_timestamp', 'success', 'api_response_time', 'attempts']
-        ordered_result = {k: result.get(k) for k in base_fields}
+        """Cria um dicionário de resultado final com uma ordem de campos padronizada."""
+        # CORREÇÃO: Usa o parâmetro `start_timestamp_iso` diretamente.
+        ordered_result = {
+            'id': result.get('id'),
+            'start_timestamp': start_timestamp_iso,
+            'success': result.get('success'),
+            'api_response_time': result.get('api_response_time'),
+            'attempts': result.get('attempts')
+        }
         if result.get('success'):
             success_fields = ['input_tokens', 'output_tokens', 'cached_tokens', 'total_tokens', 'cost', 'content']
             ordered_result.update({k: result.get(k) for k in success_fields})
@@ -268,12 +277,18 @@ class AIProcessor:
         return await asyncio.gather(*tasks)
 
     def _get_final_batch_id(self, batch_id: Optional[str], prefix: str) -> str:
+        """Cria um ID de lote final e único."""
         unique_timestamp = int(time.time())
         if batch_id:
             return f"{batch_id}_{unique_timestamp}"
         return f"{prefix}_batch_{unique_timestamp}"
 
     def _log_batch_completion(self, batch_id: str, batch_stats: stats_manager.StatsContainer):
+        """Gera um log detalhado e conciso na conclusão de um lote."""
+        if not batch_stats:
+            logger.error(f"Não foi possível gerar log de conclusão para o lote '{batch_id}' pois as estatísticas não foram encontradas.")
+            return
+
         summary = (
             f"✅ Lote '{batch_id}' concluído. "
             f"Duração: {batch_stats.processing_time:.2f}s | "
@@ -281,12 +296,25 @@ class AIProcessor:
             f"Tokens Totais: {batch_stats.total_input_tokens + batch_stats.total_output_tokens:,} | "
             f"Sucesso: {batch_stats.successful_requests}/{batch_stats.total_requests}"
         )
-        logger.info(summary, extra={
-            'action': 'batch_complete', 'batch_id': batch_id, **batch_stats.__dict__
-        })
+        
+        # CORREÇÃO: Log com um extra enxuto, sem listas ou objetos grandes.
+        extra_log = {
+            'action': 'batch_complete',
+            'batch_id': batch_id,
+            'processing_time': round(batch_stats.processing_time, 2),
+            'total_cost': round(batch_stats.total_cost, 4),
+            'total_requests': batch_stats.total_requests,
+            'successful_requests': batch_stats.successful_requests,
+            'failed_requests': batch_stats.failed_requests,
+            'total_tokens': batch_stats.total_input_tokens + batch_stats.total_output_tokens,
+            'avg_api_latency': round(batch_stats.avg_api_latency, 3),
+            'concurrent_peak': batch_stats.concurrent_peak
+        }
+        logger.info(summary, extra=extra_log)
 
     async def process_batch(self, texts: List[str], prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
                             batch_id: Optional[str] = None, custom_ids: Optional[Any] = None, model: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        """Processa uma lista de textos em lote via chat completion."""
         final_batch_id = self._get_final_batch_id(batch_id, "chat")
         
         self.stats_manager.start_batch(final_batch_id)
@@ -308,11 +336,15 @@ class AIProcessor:
         )
         
         batch_stats = self.stats_manager.end_batch(final_batch_id)
-        self._log_batch_completion(final_batch_id, batch_stats)
+        if batch_stats:
+            self.batch_stats_cache[final_batch_id] = batch_stats
+            self._log_batch_completion(final_batch_id, batch_stats)
+
         return {'results': results, 'batch_stats': batch_stats, 'batch_id': final_batch_id}
 
     async def process_embedding_batch(self, texts: List[str], batch_id: Optional[str] = None,
                                       custom_ids: Optional[Any] = None, model: Optional[str] = None) -> Dict[str, Any]:
+        """Gera embeddings para uma lista de textos em lote."""
         final_batch_id = self._get_final_batch_id(batch_id, "embedding")
 
         self.stats_manager.start_batch(final_batch_id)
@@ -331,14 +363,17 @@ class AIProcessor:
         )
         
         batch_stats = self.stats_manager.end_batch(final_batch_id)
-        self._log_batch_completion(final_batch_id, batch_stats)
+        if batch_stats:
+            self.batch_stats_cache[final_batch_id] = batch_stats
+            self._log_batch_completion(final_batch_id, batch_stats)
+
         return {'results': results, 'batch_stats': batch_stats, 'batch_id': final_batch_id}
 
     # --- Métodos de acesso a estatísticas ---
 
     def get_batch_stats(self, batch_id: str) -> Optional[stats_manager.StatsContainer]:
-        """Retorna o objeto de estatísticas para um lote específico."""
-        return self.stats_manager.get_batch_stats(batch_id)
+        """Retorna o objeto de estatísticas para um lote específico a partir do cache."""
+        return self.batch_stats_cache.get(batch_id)
 
     def get_global_stats(self) -> stats_manager.StatsContainer:
         """Retorna o objeto de estatísticas globais."""
