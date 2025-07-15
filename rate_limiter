@@ -6,30 +6,26 @@ from typing import Deque, Tuple, Callable, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-# --- Constantes de Configuração para o Rate Limiter Inteligente ---
+# --- Constantes de Configuração para o Rate Limiter Avançado ---
 WINDOW_SECONDS = 60.0
 METRICS_HISTORY_SIZE = 100
 TPM_TARGET_FACTOR = 0.90
-# Cooldown entre ajustes para evitar oscilações.
-ADJUSTMENT_COOLDOWN_SECONDS = 10.0
-# Limites de segurança para a concorrência.
-MIN_CONCURRENCY = 2
+ADJUSTMENT_COOLDOWN_SECONDS = 5.0
+MIN_CONCURRENCY = 5
 MAX_CONCURRENCY = 1000
-# Limiar para evitar ajustes triviais e spam de logs.
-MIN_ADJUSTMENT_STEP = 5
-# Fator para detectar aumento de latência. Se a latência subir 30%, é um sinal.
-LATENCY_INCREASE_FACTOR = 1.3
-# --- Parâmetros do Algoritmo AIMD (Additive Increase, Multiplicative Decrease) ---
-# Fator para a redução agressiva da concorrência em caso de problemas.
+
+# --- Parâmetros do Algoritmo de Controle de Gradiente ---
+# Aumento agressivo da concorrência quando o sistema está saudável.
+MULTIPLICATIVE_INCREASE_FACTOR = 1.2  # Aumenta a concorrência em 20%.
+# Redução rápida da concorrência em caso de sobrecarga.
 MULTIPLICATIVE_DECREASE_FACTOR = 0.8  # Reduz a concorrência para 80% da atual.
-# Aumento gradual e cauteloso da concorrência em tempos de estabilidade.
-ADDITIVE_INCREASE_STEP = 5
+# Limiar para considerar uma mudança de latência ou vazão como significativa.
+PERFORMANCE_CHANGE_THRESHOLD = 0.05  # Mudança de 5% é considerada relevante.
 
 class AdaptiveRateLimiter:
     """
-    Um governador de vazão que utiliza um algoritmo AIMD (Additive Increase,
-    Multiplicative Decrease) para gerenciar a concorrência de forma estável,
-    considerando tanto o limite de TPM quanto a latência da API.
+    Um governador de vazão que utiliza um algoritmo de controle de gradiente
+    para otimizar a concorrência, balanceando latência e vazão (throughput).
     """
 
     def __init__(
@@ -45,39 +41,52 @@ class AdaptiveRateLimiter:
         self._stats_callback = stats_callback
         self._lock = asyncio.Lock()
 
-        # --- Estado do Controle de Fluxo ---
+        # --- Estado do Controle de Fluxo e Performance ---
         self.token_usage_window: Deque[Tuple[float, int]] = deque()
         self.tokens_in_window: int = 0
+        self.request_completion_times: Deque[float] = deque(maxlen=METRICS_HISTORY_SIZE)
         self.recent_latencies: Deque[float] = deque(maxlen=METRICS_HISTORY_SIZE)
+        
         self._avg_latency: float = 1.0
+        self._avg_throughput: float = 0.0
 
         # --- Estado do Controle de Concorrência ---
         self._semaphore = asyncio.Semaphore(initial_concurrency)
         self.dynamic_concurrency = initial_concurrency
         self._is_adjusting_semaphore = False
         self._last_adjustment_time: float = 0.0
-        # Flag para garantir que o sistema se estabilize após uma redução.
         self._in_backoff_cooldown = False
 
         logger.info(
-            "AdaptiveRateLimiter (AIMD Governor) inicializado",
+            "AdaptiveRateLimiter (Gradient-Aware Governor) inicializado",
             extra={'action': 'rate_limiter_init', 'max_tpm': self.effective_max_tpm,
                    'initial_concurrency': self.dynamic_concurrency}
         )
 
-    def _prune_usage_window(self):
+    def _update_performance_metrics(self):
+        """Calcula a latência e a vazão médias com base no histórico recente."""
+        if self.recent_latencies:
+            self._avg_latency = sum(self.recent_latencies) / len(self.recent_latencies)
+        
         now = time.time()
-        while self.token_usage_window and (now - self.token_usage_window[0][0] > WINDOW_SECONDS):
-            _timestamp, tokens = self.token_usage_window.popleft()
-            self.tokens_in_window -= tokens
+        # Filtra os timestamps de conclusão para a janela de cálculo de vazão (ex: últimos 10s)
+        recent_completions = [t for t in self.request_completion_times if now - t <= 10.0]
+        if recent_completions:
+            self._avg_throughput = len(recent_completions) / 10.0
+        else:
+            self._avg_throughput = 0.0
 
     async def await_permission_to_proceed(self, batch_id: Any = None) -> None:
         await self._semaphore.acquire()
         async with self._lock:
-            self._prune_usage_window()
+            now = time.time()
+            while self.token_usage_window and (now - self.token_usage_window[0][0] > WINDOW_SECONDS):
+                self.token_usage_window.popleft()
+            
+            self.tokens_in_window = sum(t[1] for t in self.token_usage_window)
             target_tpm = self.effective_max_tpm * TPM_TARGET_FACTOR
             if self.tokens_in_window >= target_tpm:
-                wait_time = (WINDOW_SECONDS - (time.time() - self.token_usage_window[0][0])) if self.token_usage_window else 0
+                wait_time = (WINDOW_SECONDS - (now - self.token_usage_window[0][0])) if self.token_usage_window else 0
                 if wait_time > 0:
                     self._stats_callback({'event_type': 'proactive_pause', 'wait_time': wait_time}, batch_id)
                     await asyncio.sleep(wait_time)
@@ -90,56 +99,57 @@ class AdaptiveRateLimiter:
         asyncio.create_task(self._async_process_result(tokens_used, success, latency, batch_id))
 
     async def _async_process_result(self, tokens_used: int, success: bool, latency: float, batch_id: Any):
+        previous_avg_latency = self._avg_latency
+        previous_avg_throughput = self._avg_throughput
+
         async with self._lock:
             if success:
-                if tokens_used > 0:
-                    self.token_usage_window.append((time.time(), tokens_used))
-                    self.tokens_in_window += tokens_used
-                if latency > 0:
-                    self.recent_latencies.append(latency)
-                    self._avg_latency = sum(self.recent_latencies) / len(self.recent_latencies)
-            self._prune_usage_window()
+                self.token_usage_window.append((time.time(), tokens_used))
+                self.tokens_in_window += tokens_used
+                self.request_completion_times.append(time.time())
+                self.recent_latencies.append(latency)
+            
+            self._update_performance_metrics()
         
         self._stats_callback({'event_type': 'token_usage_update', 'current_tpm': self.tokens_in_window}, batch_id)
         
-        await self._unified_concurrency_strategy(success, latency)
+        await self._gradient_concurrency_strategy(success, previous_avg_latency, previous_avg_throughput)
 
-    async def _unified_concurrency_strategy(self, success: bool, current_latency: float):
-        """Implementa a lógica AIMD unificada para ajustar a concorrência."""
+    async def _gradient_concurrency_strategy(self, success: bool, prev_latency: float, prev_throughput: float):
+        """Ajusta a concorrência com base na 'derivada' da performance (latência vs. vazão)."""
         now = time.time()
         if self._is_adjusting_semaphore or (now - self._last_adjustment_time < ADJUSTMENT_COOLDOWN_SECONDS):
             return
 
-        # --- Multiplicative Decrease (Ação Rápida) ---
-        should_decrease = False
-        reason = ""
-        if not success:
-            should_decrease = True
-            reason = "request_failed"
-        elif current_latency > self._avg_latency * LATENCY_INCREASE_FACTOR and len(self.recent_latencies) > 10:
-            should_decrease = True
-            reason = "latency_spike"
+        # --- Multiplicative Decrease (Redução Agressiva) ---
+        latency_change = (self._avg_latency - prev_latency) / prev_latency if prev_latency > 0 else 0
+        throughput_change = (self._avg_throughput - prev_throughput) / prev_throughput if prev_throughput > 0 else 0
 
-        if should_decrease:
+        # Reduz se a requisição falhou OU se a latência aumentou sem um ganho compensatório de vazão.
+        if not success or (latency_change > PERFORMANCE_CHANGE_THRESHOLD and latency_change > throughput_change):
             new_concurrency = max(MIN_CONCURRENCY, int(self.dynamic_concurrency * MULTIPLICATIVE_DECREASE_FACTOR))
             if new_concurrency < self.dynamic_concurrency:
                 logger.warning(
-                    f"Sinal de sobrecarga detectado (motivo: {reason}). "
-                    f"Reduzindo concorrência de {self.dynamic_concurrency} para {new_concurrency}.",
-                    extra={'action': 'multiplicative_decrease', 'reason': reason}
+                    f"Sinal de sobrecarga detectado (latência subiu mais que a vazão). "
+                    f"Reduzindo concorrência para {new_concurrency}.",
+                    extra={'action': 'gradient_decrease', 'latency_change': latency_change, 'throughput_change': throughput_change}
                 )
                 await self._set_concurrency(new_concurrency)
-                self._in_backoff_cooldown = True # Ativa o cooldown para estabilizar.
+                self._in_backoff_cooldown = True
             return
 
-        # --- Additive Increase (Ação Lenta) ---
+        # --- Multiplicative Increase (Aumento Agressivo) ---
         if self._in_backoff_cooldown:
             if now - self._last_adjustment_time > ADJUSTMENT_COOLDOWN_SECONDS * 2:
                 self._in_backoff_cooldown = False
             else:
                 return 
 
-        new_concurrency = min(MAX_CONCURRENCY, self.dynamic_concurrency + ADDITIVE_INCREASE_STEP)
+        new_concurrency = min(MAX_CONCURRENCY, int(self.dynamic_concurrency * MULTIPLICATIVE_INCREASE_FACTOR))
+        # Garante que o aumento seja de pelo menos 1 para não estagnar.
+        if new_concurrency <= self.dynamic_concurrency:
+            new_concurrency = self.dynamic_concurrency + 1
+
         if new_concurrency > self.dynamic_concurrency:
             await self._set_concurrency(new_concurrency)
 
