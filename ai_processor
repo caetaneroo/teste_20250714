@@ -8,6 +8,7 @@ import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Optional, Callable
+from dataclasses import dataclass
 
 from tenacity import AsyncRetrying, RetryError, stop_after_attempt, wait_fixed
 from iaragenai import AsyncIaraGenAI
@@ -256,10 +257,6 @@ class AIProcessor:
         await self.stats_manager.record_request(batch_id=batch_id, model=model, retry_count=max(0, result.get('attempts', 1) - 1), **result)
 
     async def _run_batch_processor(self, worker_coro: Callable, items: List, **kwargs):
-        """
-        Função genérica para executar um lote, gerenciando a concorrência local.
-        **CORREÇÃO:** Removido o parâmetro `batch_id` explícito para evitar duplicação.
-        """
         effective_concurrency = min(self.config.initial_concurrency, len(items))
         semaphore = asyncio.Semaphore(effective_concurrency)
         
@@ -271,14 +268,12 @@ class AIProcessor:
         return await asyncio.gather(*tasks)
 
     def _get_final_batch_id(self, batch_id: Optional[str], prefix: str) -> str:
-        """Cria um ID de lote final e único."""
         unique_timestamp = int(time.time())
         if batch_id:
             return f"{batch_id}_{unique_timestamp}"
         return f"{prefix}_batch_{unique_timestamp}"
 
     def _log_batch_completion(self, batch_id: str, batch_stats: stats_manager.StatsContainer):
-        """Gera um log detalhado na conclusão de um lote."""
         summary = (
             f"✅ Lote '{batch_id}' concluído. "
             f"Duração: {batch_stats.processing_time:.2f}s | "
@@ -292,7 +287,6 @@ class AIProcessor:
 
     async def process_batch(self, texts: List[str], prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
                             batch_id: Optional[str] = None, custom_ids: Optional[Any] = None, model: Optional[str] = None, **kwargs) -> Dict[str, Any]:
-        """Processa uma lista de textos em lote via chat completion."""
         final_batch_id = self._get_final_batch_id(batch_id, "chat")
         
         self.stats_manager.start_batch(final_batch_id)
@@ -302,7 +296,6 @@ class AIProcessor:
         progress_tracker = self._BatchProgressTracker(total=len(texts), batch_id=final_batch_id)
         items_to_process = [(i, texts[i], (normalized_ids[i] if normalized_ids else None)) for i in range(len(texts))]
 
-        # **CORREÇÃO:** Removida a passagem posicional de `final_batch_id`.
         results = await self._run_batch_processor(
             worker_coro=self._process_item_in_batch,
             items=items_to_process,
@@ -320,7 +313,6 @@ class AIProcessor:
 
     async def process_embedding_batch(self, texts: List[str], batch_id: Optional[str] = None,
                                       custom_ids: Optional[Any] = None, model: Optional[str] = None) -> Dict[str, Any]:
-        """Gera embeddings para uma lista de textos em lote."""
         final_batch_id = self._get_final_batch_id(batch_id, "embedding")
 
         self.stats_manager.start_batch(final_batch_id)
@@ -330,7 +322,6 @@ class AIProcessor:
         progress_tracker = self._BatchProgressTracker(total=len(texts), batch_id=final_batch_id)
         items_to_process = [(i, texts[i], (normalized_ids[i] if normalized_ids else None)) for i in range(len(texts))]
 
-        # **CORREÇÃO:** Removida a passagem posicional de `final_batch_id`.
         results = await self._run_batch_processor(
             worker_coro=self._process_embedding_item,
             items=items_to_process,
