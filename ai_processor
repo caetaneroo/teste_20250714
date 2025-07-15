@@ -197,9 +197,31 @@ class AIProcessor:
                             'cost': self._calculate_cost(model, input_tokens, output_tokens, cached_tokens),
                             'api_response_time': time.time() - start_time, 'attempts': attempt.retry_state.attempt_number
                         }
+                    
+                    # --- INÍCIO DA CORREÇÃO ---
+                    # Lógica de tratamento de timeout aprimorada para evitar exceções não tratadas.
                     except asyncio.TimeoutError:
-                        logger.warning(f"API call timed out (> {API_CALL_TIMEOUT_SECONDS}s) for request {request_id}. Retrying...")
+                        is_last_attempt = attempt.retry_state.attempt_number == self.config.max_retry
+                        logger.warning(
+                            f"API call timed out (> {API_CALL_TIMEOUT_SECONDS}s) for request {request_id}. "
+                            f"Attempt {attempt.retry_state.attempt_number}/{self.config.max_retry}."
+                            f"{' This was the final attempt.' if is_last_attempt else ' Retrying...'}"
+                        )
+                        if is_last_attempt:
+                            # Na última tentativa, não levanta a exceção. Em vez disso, retorna um
+                            # dicionário de erro estruturado para uma saída graciosa.
+                            return {
+                                'id': request_id, 'success': False,
+                                'error': f'API call failed after {self.config.max_retry} attempts due to repeated timeouts.',
+                                'error_details': {'type': 'TimeoutError', 'message': f'API call exceeded {API_CALL_TIMEOUT_SECONDS}s.'},
+                                'model': model, 'error_type': 'TimeoutError',
+                                'api_response_time': time.time() - start_time,
+                                'attempts': attempt.retry_state.attempt_number
+                            }
+                        # Se não for a última tentativa, levanta a exceção para que o tenacity possa fazer a retentativa.
                         raise
+                    # --- FIM DA CORREÇÃO ---
+                        
                     except Exception as e:
                         error_details = {'type': type(e).__name__, 'message': str(e)}
                         error_result = {'id': request_id, 'success': False, 'error': str(e), 'error_details': error_details, 'error_type': type(e).__name__,
@@ -211,6 +233,7 @@ class AIProcessor:
                             raise
                         return error_result
         except RetryError as retry_error:
+            # Este bloco ainda é útil para outros erros que esgotam as retentativas (ex: rate limits persistentes).
             last_exception = retry_error.last_attempt.exception()
             return {'id': request_id, 'success': False, 'error': f'Máximo de {self.config.max_retry} tentativas excedido.',
                     'error_details': {'type': type(last_exception).__name__, 'message': str(last_exception)}, 'model': model,
@@ -222,6 +245,9 @@ class AIProcessor:
         base_fields = ['id', 'start_timestamp', 'success', 'model', 'api_response_time', 'attempts']
         ordered_result = {k: result.get(k) for k in base_fields}
         
+        # Adiciona o timestamp de início ao resultado ordenado
+        ordered_result['start_timestamp'] = start_timestamp_iso
+
         if result.get('success'):
             ordered_result.update({k: result.get(k) for k in ['input_tokens', 'output_tokens', 'cached_tokens', 'total_tokens', 'cost', 'content']})
         else:
@@ -230,7 +256,6 @@ class AIProcessor:
 
     async def _process_and_record_result(self, result: Dict[str, Any], model: str, batch_id: Optional[str] = None):
         """Processa e registra o resultado, evitando a duplicação de argumentos."""
-        # CORREÇÃO: Cria uma cópia do resultado e remove a chave 'model' antes de desempacotar.
         result_for_stats = result.copy()
         result_for_stats.pop('model', None)
 
@@ -242,9 +267,9 @@ class AIProcessor:
         )
         await self.stats_manager.record_request(
             batch_id=batch_id, 
-            model=model,  # Passa 'model' explicitamente.
+            model=model,
             retry_count=max(0, result.get('attempts', 1) - 1), 
-            **result_for_stats # Passa o resto dos resultados.
+            **result_for_stats
         )
 
     async def _run_batch_processor(self, worker_coro: Callable, items: List, **kwargs):
