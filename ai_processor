@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Fuso horário de referência (America/Sao_Paulo para Horário de Brasília)
 BR_TIMEZONE = ZoneInfo("America/Sao_Paulo")
 
-# --- Constantes de Configuração Padrão ---
+# --- Constantes de Configuração Padrão (Atualizadas) ---
 DEFAULT_MAX_RETRY = 3
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_MAX_TPM = 1500000
@@ -54,27 +54,15 @@ def load_models_config(config_path: str = "models.json") -> Dict[str, Any]:
     
     try:
         with open(full_config_path, 'r', encoding='utf-8') as f:
-            models_config = json.load(f)
-        if not models_config or not isinstance(models_config, dict):
-            raise ValueError(f"Arquivo '{full_config_path}' está vazio ou não é um dicionário JSON válido.")
-        return models_config
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Erro ao decodificar JSON em '{full_config_path}': {e}")
+            return json.load(f)
     except Exception as e:
-        raise RuntimeError(f"Erro inesperado ao carregar '{full_config_path}': {e}")
+        raise RuntimeError(f"Erro ao carregar '{full_config_path}': {e}")
 
 class JSONSchemaNotSupportedError(Exception):
-    """Exceção levantada quando json_schema é usado com um modelo incompatível."""
     pass
 
 class AIProcessor:
-    """
-    Orquestrador de chamadas para a API de IA, suportando chat completions e embeddings,
-    com alta eficiência, robustez e visibilidade operacional.
-    """
-
     class _BatchProgressTracker:
-        """Classe interna para rastrear o progresso de um lote de forma atômica."""
         def __init__(self, total: int, batch_id: str):
             self.total = total
             self.batch_id = batch_id
@@ -85,63 +73,43 @@ class AIProcessor:
             self._lock = asyncio.Lock()
 
         async def increment_and_log(self, tokens_used: int = 0):
-            """Incrementa o contador, adiciona tokens e loga progresso com métricas de tokens."""
             async with self._lock:
                 self.completed_count += 1
                 self.total_tokens_used += tokens_used
                 progress_percent = (self.completed_count / self.total) * 100
                 current_milestone = int(progress_percent // 10) * 10
-                
                 if current_milestone > 0 and current_milestone not in self.logged_milestones:
                     self.logged_milestones.add(current_milestone)
                     elapsed = time.time() - self.start_time
                     req_rate = self.completed_count / elapsed if elapsed > 0 else 0
                     tpm_rate = (self.total_tokens_used / elapsed) * 60 if elapsed > 0 else 0
                     eta_seconds = (self.total - self.completed_count) / req_rate if req_rate > 0 else 0
-                    
                     logger.info(
                         f"📊 Progresso do Lote '{self.batch_id}': {self.completed_count}/{self.total} ({progress_percent:.1f}%) | "
-                        f"Taxa Req: {req_rate:.2f}/s | Taxa TPM: {tpm_rate:,.0f} | Tokens Usados: {self.total_tokens_used:,} | ETA: {eta_seconds/60:.1f} min",
-                        extra={'action': 'batch_progress', 'batch_id': self.batch_id, 'completed': self.completed_count,
-                               'total': self.total, 'progress_percent': round(progress_percent, 1),
-                               'req_rate': round(req_rate, 2), 'tpm_rate': round(tpm_rate), 'total_tokens': self.total_tokens_used,
-                               'eta_minutes': round(eta_seconds / 60, 1)}
+                        f"Taxa Req: {req_rate:.2f}/s | Taxa TPM: {tpm_rate:,.0f} | ETA: {eta_seconds/60:.1f} min"
                     )
 
     def __init__(self, config: AIProcessorConfig):
         self.models_config = load_models_config()
-        self.supported_models = set(self.models_config.keys())
         self.config = config
-        
         self.client = AsyncIaraGenAI(
-            client_id=self.config.client_id,
-            client_secret=self.config.client_secret,
-            environment=self.config.environment,
-            provider=self.config.provider,
-            correlation_id=self.config.correlation_id
+            client_id=config.client_id, client_secret=config.client_secret,
+            environment=config.environment, provider=config.provider, correlation_id=config.correlation_id
         )
-        
-        if self.config.model not in self.supported_models:
-            raise ValueError(f"Modelo '{self.config.model}' não suportado. Modelos disponíveis: {', '.join(sorted(self.supported_models))}")
-        
-        self.stats_manager = stats_manager.StatsManager(max_tpm=self.config.max_tpm)
-        
+        self.stats_manager = stats_manager.StatsManager(max_tpm=config.max_tpm)
         self.rate_limiter = rate_limiter.AdaptiveRateLimiter(
-            max_tpm=self.config.max_tpm,
+            max_tpm=config.max_tpm,
             stats_callback=self._create_stats_callback(),
-            initial_concurrency=self.config.initial_concurrency
+            initial_concurrency=config.initial_concurrency
         )
-        
-        self.embedding_cache: Optional[Dict[str, List[float]]] = {} if self.config.enable_embedding_cache else None
-        self.batch_stats_cache: Dict[str, stats_manager.StatsContainer] = {}
-        
-        # Cooldown para evitar spam de logs de pausa pró-ativa
-        self._last_proactive_pause_log_time = 0
-        self.proactive_pause_log_cooldown_seconds = 5.0
+        self.embedding_cache = {} if config.enable_embedding_cache else None
+        self.batch_stats_cache = {}
 
-        logger.info("AIProcessor inicializado",
-                    extra={'action': 'ai_processor_init', 'model': self.config.model, 'embedding_model': self.config.embedding_model})
-
+    def _create_stats_callback(self) -> Callable:
+        def callback(event: Dict[str, Any], batch_id: Optional[str] = None):
+            asyncio.create_task(self.stats_manager.record_rate_limiter_event(event, batch_id))
+        return callback
+        
     def _get_model_pricing(self, model: str) -> Dict[str, float]:
         model_data = self.models_config.get(model, {})
         return {'input': model_data.get('input', 0.0), 'output': model_data.get('output', 0.0), 'cache': model_data.get('cache', 0.0)}
@@ -150,22 +118,6 @@ class AIProcessor:
         pricing = self._get_model_pricing(model)
         regular_input = max(0, input_tokens - cached_tokens)
         return ((regular_input / 1000) * pricing['input'] + (cached_tokens / 1000) * pricing['cache'] + (output_tokens / 1000) * pricing['output'])
-
-    def _create_stats_callback(self) -> Callable:
-        """Cria um callback inteligente para o RateLimiter enviar eventos ao StatsManager."""
-        def callback(event: Dict[str, Any], batch_id: Optional[str] = None):
-            event_type = event.get('event_type')
-            
-            # Aplica cooldown no log de pausas pró-ativas
-            if event_type == 'proactive_pause':
-                now = time.time()
-                if (now - self._last_proactive_pause_log_time) > self.proactive_pause_log_cooldown_seconds:
-                    self._last_proactive_pause_log_time = now
-                    asyncio.create_task(self.stats_manager.record_rate_limiter_event(event, batch_id))
-            else:
-                # Encaminha outros eventos normalmente
-                asyncio.create_task(self.stats_manager.record_rate_limiter_event(event, batch_id))
-        return callback
 
     def _supports_json_schema(self, model: str) -> bool:
         return self.models_config.get(model, {}).get('json_schema', False)
@@ -209,13 +161,8 @@ class AIProcessor:
 
     async def _make_api_call(self, params: Dict[str, Any], request_id: str, batch_id: Optional[str] = None, is_embedding: bool = False) -> Dict[str, Any]:
         model = params.get('model', self.config.model if not is_embedding else self.config.embedding_model)
-        
-        # A lógica para não aumentar a concorrência se a latência estiver subindo
-        # é melhor implementada dentro do próprio AdaptiveRateLimiter, que agora considera
-        # a latência como um sinal de saúde do sistema.
         await self.rate_limiter.await_permission_to_proceed(batch_id)
         await self.stats_manager.record_concurrent_start(batch_id)
-        
         try:
             async for attempt in AsyncRetrying(stop=stop_after_attempt(self.config.max_retry), wait=wait_fixed(1), reraise=True):
                 with attempt:
@@ -235,14 +182,13 @@ class AIProcessor:
                             input_tokens, output_tokens = response.usage.prompt_tokens, response.usage.completion_tokens
                             cached_tokens = getattr(getattr(response.usage, 'prompt_tokens_details', {}), 'cached_tokens', 0)
                         
-                        api_response_time = time.time() - start_time
                         return {
                             'id': request_id, 'success': True, 'content': content,
                             'input_tokens': input_tokens, 'output_tokens': output_tokens,
                             'cached_tokens': cached_tokens, 'total_tokens': input_tokens + output_tokens,
                             'tokens_for_limiter': (input_tokens - cached_tokens) + output_tokens,
                             'cost': self._calculate_cost(model, input_tokens, output_tokens, cached_tokens),
-                            'api_response_time': api_response_time, 'attempts': attempt.retry_state.attempt_number
+                            'api_response_time': time.time() - start_time, 'attempts': attempt.retry_state.attempt_number
                         }
                     except Exception as e:
                         error_details = {'type': type(e).__name__, 'message': str(e), 'traceback': traceback.format_exc()}
@@ -256,76 +202,62 @@ class AIProcessor:
                         return error_result
         except RetryError as retry_error:
             last_exception = retry_error.last_attempt.exception()
-            error_details = {'type': type(last_exception).__name__, 'message': str(last_exception), 'traceback': traceback.format_exc()}
             return {'id': request_id, 'success': False, 'error': f'Máximo de {self.config.max_retry} tentativas excedido.',
-                    'error_details': error_details, 'error_type': 'RetryError', 'attempts': self.config.max_retry}
+                    'error_details': {'type': type(last_exception).__name__, 'message': str(last_exception)}, 'error_type': 'RetryError', 'attempts': self.config.max_retry}
         finally:
             await self.stats_manager.record_concurrent_end(batch_id)
 
     def _create_ordered_result(self, result: Dict[str, Any], start_timestamp_iso: str) -> Dict[str, Any]:
         ordered_result = {
-            'id': result.get('id'),
-            'start_timestamp': start_timestamp_iso,
-            'success': result.get('success'),
-            'api_response_time': result.get('api_response_time'),
+            'id': result.get('id'), 'start_timestamp': start_timestamp_iso,
+            'success': result.get('success'), 'api_response_time': result.get('api_response_time'),
             'attempts': result.get('attempts')
         }
         if result.get('success'):
-            success_fields = ['input_tokens', 'output_tokens', 'cached_tokens', 'total_tokens', 'cost', 'content']
-            ordered_result.update({k: result.get(k) for k in success_fields})
+            ordered_result.update({k: result.get(k) for k in ['input_tokens', 'output_tokens', 'cached_tokens', 'total_tokens', 'cost', 'content']})
         else:
-            error_fields = ['error', 'error_details']
-            ordered_result.update({k: result.get(k) for k in error_fields})
+            ordered_result.update({k: result.get(k) for k in ['error', 'error_details']})
         return ordered_result
 
     async def _process_and_record_result(self, result: Dict[str, Any], model: str, batch_id: Optional[str] = None):
+        """Processa e registra o resultado, agora passando a latência para o rate limiter."""
         self.rate_limiter.record_request_completion(
             tokens_used=result.get('tokens_for_limiter', 0),
             success=result.get('success', False),
-            latency=result.get('api_response_time', 0.0),
+            latency=result.get('api_response_time', 0.0), # Passando a latência
             batch_id=batch_id
         )
-        await self.stats_manager.record_request(batch_id=batch_id, model=model, retry_count=max(0, result.get('attempts', 1) - 1), **result)
+        await self.stats_manager.record_request(
+            batch_id=batch_id, model=model, retry_count=max(0, result.get('attempts', 1) - 1), **result
+        )
 
     async def _run_batch_processor(self, worker_coro: Callable, items: List, **kwargs):
         effective_concurrency = min(self.config.initial_concurrency, len(items))
         semaphore = asyncio.Semaphore(effective_concurrency)
-        
         async def sem_worker(item):
             async with semaphore:
                 return await worker_coro(item, **kwargs)
-
         tasks = [asyncio.create_task(sem_worker(item)) for item in items]
         return await asyncio.gather(*tasks)
 
     def _get_final_batch_id(self, batch_id: Optional[str], prefix: str) -> str:
         unique_timestamp = int(time.time())
-        if batch_id:
-            return f"{batch_id}_{unique_timestamp}"
-        return f"{prefix}_batch_{unique_timestamp}"
+        return f"{batch_id}_{unique_timestamp}" if batch_id else f"{prefix}_batch_{unique_timestamp}"
 
     def _log_batch_completion(self, batch_id: str, batch_stats: stats_manager.StatsContainer):
-        if not batch_stats:
-            logger.error(f"Não foi possível gerar log de conclusão para o lote '{batch_id}' pois as estatísticas não foram encontradas.")
-            return
-
+        if not batch_stats: return
         summary = (
             f"✅ Lote '{batch_id}' concluído. "
             f"Duração: {batch_stats.processing_time:.2f}s | "
-            f"Custo Total: ${batch_stats.total_cost:.4f} | "
-            f"Tokens Totais: {batch_stats.total_input_tokens + batch_stats.total_output_tokens:,} | "
+            f"Custo: ${batch_stats.total_cost:.4f} | "
+            f"Tokens: {batch_stats.total_input_tokens + batch_stats.total_output_tokens:,} | "
             f"Sucesso: {batch_stats.successful_requests}/{batch_stats.total_requests}"
         )
-        
         extra_log = {
-            'action': 'batch_complete',
-            'batch_id': batch_id,
+            'action': 'batch_complete', 'batch_id': batch_id,
             'processing_time': round(batch_stats.processing_time, 2),
             'total_cost': round(batch_stats.total_cost, 4),
             'total_requests': batch_stats.total_requests,
-            'successful_requests': batch_stats.successful_requests,
-            'failed_requests': batch_stats.failed_requests,
-            'total_tokens': batch_stats.total_input_tokens + batch_stats.total_output_tokens,
             'avg_api_latency': round(batch_stats.avg_api_latency, 3),
             'concurrent_peak': batch_stats.concurrent_peak
         }
@@ -334,69 +266,41 @@ class AIProcessor:
     async def process_batch(self, texts: List[str], prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
                             batch_id: Optional[str] = None, custom_ids: Optional[Any] = None, model: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         final_batch_id = self._get_final_batch_id(batch_id, "chat")
-        
         self.stats_manager.start_batch(final_batch_id)
         normalized_ids = self._normalize_ids(custom_ids, len(texts))
-        
-        logger.info(f"🚀 Iniciando processamento de chat em lote '{final_batch_id}' com {len(texts)} itens.")
-        progress_tracker = self._BatchProgressTracker(total=len(texts), batch_id=final_batch_id)
+        logger.info(f"🚀 Iniciando lote de chat '{final_batch_id}' com {len(texts)} itens.")
+        progress_tracker = self._BatchProgressTracker(len(texts), final_batch_id)
         items_to_process = [(i, texts[i], (normalized_ids[i] if normalized_ids else None)) for i in range(len(texts))]
-
-        results = await self._run_batch_processor(
-            worker_coro=self._process_item_in_batch,
-            items=items_to_process,
-            prompt_template=prompt_template,
-            json_schema=json_schema,
-            batch_id=final_batch_id,
-            progress_tracker=progress_tracker,
-            model=model,
-            **kwargs
-        )
-        
+        results = await self._run_batch_processor(self._process_item_in_batch, items_to_process,
+            prompt_template=prompt_template, json_schema=json_schema, batch_id=final_batch_id,
+            progress_tracker=progress_tracker, model=model, **kwargs)
         batch_stats = self.stats_manager.end_batch(final_batch_id)
         if batch_stats:
             self.batch_stats_cache[final_batch_id] = batch_stats
             self._log_batch_completion(final_batch_id, batch_stats)
-
         return {'results': results, 'batch_stats': batch_stats, 'batch_id': final_batch_id}
 
     async def process_embedding_batch(self, texts: List[str], batch_id: Optional[str] = None,
                                       custom_ids: Optional[Any] = None, model: Optional[str] = None) -> Dict[str, Any]:
         final_batch_id = self._get_final_batch_id(batch_id, "embedding")
-
         self.stats_manager.start_batch(final_batch_id)
         normalized_ids = self._normalize_ids(custom_ids, len(texts))
-
-        logger.info(f"🚀 Iniciando processamento de embedding em lote '{final_batch_id}' com {len(texts)} itens.")
-        progress_tracker = self._BatchProgressTracker(total=len(texts), batch_id=final_batch_id)
+        logger.info(f"🚀 Iniciando lote de embedding '{final_batch_id}' com {len(texts)} itens.")
+        progress_tracker = self._BatchProgressTracker(len(texts), final_batch_id)
         items_to_process = [(i, texts[i], (normalized_ids[i] if normalized_ids else None)) for i in range(len(texts))]
-
-        results = await self._run_batch_processor(
-            worker_coro=self._process_embedding_item,
-            items=items_to_process,
-            batch_id=final_batch_id,
-            progress_tracker=progress_tracker,
-            model=model
-        )
-        
+        results = await self._run_batch_processor(self._process_embedding_item, items_to_process,
+            batch_id=final_batch_id, progress_tracker=progress_tracker, model=model)
         batch_stats = self.stats_manager.end_batch(final_batch_id)
         if batch_stats:
             self.batch_stats_cache[final_batch_id] = batch_stats
             self._log_batch_completion(final_batch_id, batch_stats)
-
         return {'results': results, 'batch_stats': batch_stats, 'batch_id': final_batch_id}
 
-    # --- Métodos de acesso a estatísticas ---
-
     def get_batch_stats(self, batch_id: str) -> Optional[stats_manager.StatsContainer]:
-        """Retorna o objeto de estatísticas para um lote específico a partir do cache."""
         return self.batch_stats_cache.get(batch_id)
 
     def get_global_stats(self) -> stats_manager.StatsContainer:
-        """Retorna o objeto de estatísticas globais."""
         return self.stats_manager.get_global_stats()
-
-    # --- Funções worker internas para processamento em lote ---
 
     async def _process_item_in_batch(self, item_data: tuple, prompt_template: str, json_schema: Optional[Dict[str, Any]],
                                      batch_id: str, progress_tracker: _BatchProgressTracker, model: Optional[str] = None, **kwargs):
@@ -404,12 +308,10 @@ class AIProcessor:
         index, text, custom_id = item_data
         request_id = custom_id or f"{batch_id}_req_{index}"
         prompt = prompt_template.format(text=text, **kwargs)
-        
         api_model = model or self.config.model
         params = {"model": api_model, "messages": [{"role": "user", "content": prompt}], "temperature": self.config.temperature}
         if self.config.max_tokens: params["max_tokens"] = self.config.max_tokens
         if json_schema: params["response_format"] = {"type": "json_object"}
-        
         result = await self._make_api_call(params, request_id, batch_id)
         await self._process_and_record_result(result, api_model, batch_id)
         await progress_tracker.increment_and_log(result.get('total_tokens', 0))
@@ -419,7 +321,6 @@ class AIProcessor:
         start_timestamp_iso = self._get_current_timestamp_iso()
         index, text, custom_id = item_data
         request_id = custom_id or f"{batch_id}_emb_{index}"
-        
         if self.embedding_cache is not None and text in self.embedding_cache:
             result = {'id': request_id, 'success': True, 'content': self.embedding_cache[text], 'input_tokens': 0, 'output_tokens': 0, 
                       'cached_tokens': 0, 'total_tokens': 0, 'tokens_for_limiter': 0, 'cost': 0.0, 'api_response_time': 0.0, 'attempts': 0}
@@ -430,6 +331,5 @@ class AIProcessor:
             if result.get('success') and self.embedding_cache is not None:
                 self.embedding_cache[text] = result['content']
             await self._process_and_record_result(result, api_model, batch_id)
-
         await progress_tracker.increment_and_log(result.get('total_tokens', 0))
         return self._create_ordered_result(result, start_timestamp_iso)
