@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from tenacity import AsyncRetrying, RetryError, stop_after_attempt, wait_fixed
 from iaragenai import AsyncIaraGenAI
 
-# Importe os módulos locais atualizados
 import rate_limiter
 import stats_manager
 
@@ -80,7 +79,6 @@ class AIProcessor:
                 self.total_tokens_used += tokens_used
                 progress_percent = (self.completed_count / self.total) * 100
                 
-                # Log em intervalos de 10%
                 current_milestone = int(progress_percent // 10) * 10
                 if current_milestone > 0 and current_milestone not in self.logged_milestones:
                     self.logged_milestones.add(current_milestone)
@@ -170,7 +168,6 @@ class AIProcessor:
     async def _make_api_call(self, params: Dict[str, Any], request_id: str, batch_id: Optional[str] = None, is_embedding: bool = False) -> Dict[str, Any]:
         model = params.get('model', self.config.model if not is_embedding else self.config.embedding_model)
         
-        # O controle de concorrência agora é totalmente gerenciado pelo rate limiter.
         await self.rate_limiter.await_permission_to_proceed(batch_id)
         await self.stats_manager.record_concurrent_start(batch_id)
         
@@ -194,7 +191,7 @@ class AIProcessor:
                             content = response.choices[0].message.content
                             if params.get('response_format') and content:
                                 try: content = json.loads(content)
-                                except json.JSONDecodeError: pass # Mantém como string se não for JSON válido.
+                                except json.JSONDecodeError: pass
                             input_tokens, output_tokens = response.usage.prompt_tokens, response.usage.completion_tokens
                             cached_tokens = getattr(getattr(response.usage, 'prompt_tokens_details', {}), 'cached_tokens', 0)
                         
@@ -256,7 +253,6 @@ class AIProcessor:
         return ordered_result
 
     async def _process_and_record_result(self, result: Dict[str, Any], model: str, batch_id: Optional[str], remaining_tasks: int):
-        """Processa e registra o resultado, informando ao rate limiter sobre o trabalho restante."""
         result_for_stats = result.copy()
         result_for_stats.pop('model', None)
 
@@ -265,7 +261,7 @@ class AIProcessor:
             success=result.get('success', False),
             latency=result.get('api_response_time', 0.0),
             batch_id=batch_id,
-            remaining_tasks=remaining_tasks  # Informa o trabalho restante
+            remaining_tasks=remaining_tasks
         )
         await self.stats_manager.record_request(
             batch_id=batch_id, 
@@ -275,10 +271,6 @@ class AIProcessor:
         )
 
     async def _run_batch_processor(self, worker_coro: Callable, items: List, **kwargs):
-        """
-        CORREÇÃO: O semáforo local foi removido. O controle de concorrência
-        é agora totalmente delegado ao AdaptiveRateLimiter.
-        """
         tasks = [asyncio.create_task(worker_coro(item, **kwargs)) for item in items]
         return await asyncio.gather(*tasks)
 
@@ -306,8 +298,6 @@ class AIProcessor:
         }
         logger.info(summary, extra=extra_log)
 
-    # --- Métodos de Processamento de Lote ---
-    
     async def process_batch(self, texts: List[str], prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
                             batch_id: Optional[str] = None, custom_ids: Optional[Any] = None, model: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         final_batch_id = self._get_final_batch_id(batch_id, "chat")
@@ -345,14 +335,6 @@ class AIProcessor:
             self._log_batch_completion(final_batch_id, batch_stats)
         return {'results': results, 'batch_stats': batch_stats, 'batch_id': final_batch_id}
 
-    def get_batch_stats(self, batch_id: str) -> Optional[stats_manager.StatsContainer]:
-        return self.batch_stats_cache.get(batch_id)
-
-    def get_global_stats(self) -> stats_manager.StatsContainer:
-        return self.stats_manager.get_global_stats()
-
-    # --- Métodos de Processamento de Item Individual ---
-
     async def _process_item_in_batch(self, item_data: tuple, prompt_template: str, json_schema: Optional[Dict[str, Any]],
                                      batch_id: str, progress_tracker: _BatchProgressTracker, model: Optional[str] = None, **kwargs):
         start_timestamp_iso = self._get_current_timestamp_iso()
@@ -368,7 +350,6 @@ class AIProcessor:
         result = await self._make_api_call(params, request_id, batch_id)
         
         await progress_tracker.increment_and_log(result.get('total_tokens', 0))
-        # Passa o número de tarefas restantes para o processamento de resultado
         await self._process_and_record_result(result, api_model, batch_id, progress_tracker.remaining)
         
         return self._create_ordered_result(result, start_timestamp_iso)
@@ -392,3 +373,37 @@ class AIProcessor:
         await self._process_and_record_result(result, result.get('model', 'cache'), batch_id, progress_tracker.remaining)
         
         return self._create_ordered_result(result, start_timestamp_iso)
+
+    # --- INÍCIO DA CORREÇÃO ---
+    # Métodos para acessar os relatórios de estatísticas formatados.
+
+    def get_batch_report(self, batch_id: str) -> Optional[str]:
+        """
+        Retorna um relatório de performance formatado para um batch_id específico.
+
+        Args:
+            batch_id: O ID do lote, retornado pela chamada de processamento.
+
+        Returns:
+            Uma string com o relatório formatado ou None se o batch_id não for encontrado.
+        """
+        return self.stats_manager.get_batch_report(batch_id)
+
+    def get_global_report(self) -> str:
+        """
+        Retorna um relatório de performance global formatado, consolidando
+        todos os lotes processados pela instância.
+
+        Returns:
+            Uma string com o relatório global formatado.
+        """
+        return self.stats_manager.get_global_report()
+
+    def get_batch_stats(self, batch_id: str) -> Optional[stats_manager.StatsContainer]:
+        """Retorna o objeto StatsContainer bruto para um lote específico."""
+        return self.batch_stats_cache.get(batch_id)
+
+    def get_global_stats(self) -> stats_manager.StatsContainer:
+        """Retorna o objeto StatsContainer bruto para as estatísticas globais."""
+        return self.stats_manager.get_global_stats()
+    # --- FIM DA CORREÇÃO ---
