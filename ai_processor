@@ -21,11 +21,12 @@ logger = logging.getLogger(__name__)
 # Fuso horário de referência (America/Sao_Paulo para Horário de Brasília)
 BR_TIMEZONE = ZoneInfo("America/Sao_Paulo")
 
-# --- Constantes de Configuração Padrão (Atualizadas) ---
+# --- Constantes de Configuração Padrão ---
 DEFAULT_MAX_RETRY = 3
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_MAX_TPM = 1500000
 DEFAULT_INITIAL_CONCURRENCY = 50
+API_CALL_TIMEOUT_SECONDS = 100.0
 
 @dataclass
 class AIProcessorConfig:
@@ -163,18 +164,27 @@ class AIProcessor:
         model = params.get('model', self.config.model if not is_embedding else self.config.embedding_model)
         await self.rate_limiter.await_permission_to_proceed(batch_id)
         await self.stats_manager.record_concurrent_start(batch_id)
+        
         try:
             async for attempt in AsyncRetrying(stop=stop_after_attempt(self.config.max_retry), wait=wait_fixed(1), reraise=True):
                 with attempt:
                     start_time = time.time()
                     try:
+                        # Define a chamada de API como uma corrotina
                         if is_embedding:
-                            response = await self.client.embeddings.create(**params)
+                            api_coro = self.client.embeddings.create(**params)
+                        else:
+                            self._validate_json_schema_compatibility(params.get('response_format'), model)
+                            api_coro = self.client.chat.completions.create(**params)
+                        
+                        # Executa a corrotina com um timeout
+                        response = await asyncio.wait_for(api_coro, timeout=API_CALL_TIMEOUT_SECONDS)
+                        
+                        # Processa a resposta
+                        if is_embedding:
                             content = response.data[0].embedding if isinstance(params.get("input"), str) else [emb.embedding for emb in response.data]
                             input_tokens, output_tokens, cached_tokens = response.usage.prompt_tokens, 0, 0
                         else:
-                            self._validate_json_schema_compatibility(params.get('response_format'), model)
-                            response = await self.client.chat.completions.create(**params)
                             content = response.choices[0].message.content
                             if params.get('response_format') and content:
                                 try: content = json.loads(content)
@@ -183,17 +193,21 @@ class AIProcessor:
                             cached_tokens = getattr(getattr(response.usage, 'prompt_tokens_details', {}), 'cached_tokens', 0)
                         
                         return {
-                            'id': request_id, 'success': True, 'content': content,
+                            'id': request_id, 'success': True, 'content': content, 'model': model,
                             'input_tokens': input_tokens, 'output_tokens': output_tokens,
                             'cached_tokens': cached_tokens, 'total_tokens': input_tokens + output_tokens,
                             'tokens_for_limiter': (input_tokens - cached_tokens) + output_tokens,
                             'cost': self._calculate_cost(model, input_tokens, output_tokens, cached_tokens),
                             'api_response_time': time.time() - start_time, 'attempts': attempt.retry_state.attempt_number
                         }
+                    except asyncio.TimeoutError:
+                        logger.warning(f"API call timed out (> {API_CALL_TIMEOUT_SECONDS}s) for request {request_id}. Retrying...")
+                        # Tenacity automaticamente lida com o retry ao relançar a exceção
+                        raise
                     except Exception as e:
-                        error_details = {'type': type(e).__name__, 'message': str(e), 'traceback': traceback.format_exc()}
+                        error_details = {'type': type(e).__name__, 'message': str(e)}
                         error_result = {'id': request_id, 'success': False, 'error': str(e), 'error_details': error_details, 'error_type': type(e).__name__,
-                                        'api_response_time': time.time() - start_time, 'attempts': attempt.retry_state.attempt_number,
+                                        'model': model, 'api_response_time': time.time() - start_time, 'attempts': attempt.retry_state.attempt_number,
                                         'response_headers': dict(getattr(e.response, 'headers', {}) if hasattr(e, 'response') else {})}
                         if self._is_rate_limit_error(error_result):
                             wait_time = self._extract_wait_time_from_error(error_result)
@@ -203,16 +217,15 @@ class AIProcessor:
         except RetryError as retry_error:
             last_exception = retry_error.last_attempt.exception()
             return {'id': request_id, 'success': False, 'error': f'Máximo de {self.config.max_retry} tentativas excedido.',
-                    'error_details': {'type': type(last_exception).__name__, 'message': str(last_exception)}, 'error_type': 'RetryError', 'attempts': self.config.max_retry}
+                    'error_details': {'type': type(last_exception).__name__, 'message': str(last_exception)}, 'model': model,
+                    'error_type': 'RetryError', 'attempts': self.config.max_retry}
         finally:
             await self.stats_manager.record_concurrent_end(batch_id)
 
     def _create_ordered_result(self, result: Dict[str, Any], start_timestamp_iso: str) -> Dict[str, Any]:
-        ordered_result = {
-            'id': result.get('id'), 'start_timestamp': start_timestamp_iso,
-            'success': result.get('success'), 'api_response_time': result.get('api_response_time'),
-            'attempts': result.get('attempts')
-        }
+        base_fields = ['id', 'start_timestamp', 'success', 'model', 'api_response_time', 'attempts']
+        ordered_result = {k: result.get(k) for k in base_fields}
+        
         if result.get('success'):
             ordered_result.update({k: result.get(k) for k in ['input_tokens', 'output_tokens', 'cached_tokens', 'total_tokens', 'cost', 'content']})
         else:
@@ -220,11 +233,10 @@ class AIProcessor:
         return ordered_result
 
     async def _process_and_record_result(self, result: Dict[str, Any], model: str, batch_id: Optional[str] = None):
-        """Processa e registra o resultado, agora passando a latência para o rate limiter."""
         self.rate_limiter.record_request_completion(
             tokens_used=result.get('tokens_for_limiter', 0),
             success=result.get('success', False),
-            latency=result.get('api_response_time', 0.0), # Passando a latência
+            latency=result.get('api_response_time', 0.0),
             batch_id=batch_id
         )
         await self.stats_manager.record_request(
@@ -322,7 +334,7 @@ class AIProcessor:
         index, text, custom_id = item_data
         request_id = custom_id or f"{batch_id}_emb_{index}"
         if self.embedding_cache is not None and text in self.embedding_cache:
-            result = {'id': request_id, 'success': True, 'content': self.embedding_cache[text], 'input_tokens': 0, 'output_tokens': 0, 
+            result = {'id': request_id, 'success': True, 'content': self.embedding_cache[text], 'model': 'cache', 'input_tokens': 0, 'output_tokens': 0, 
                       'cached_tokens': 0, 'total_tokens': 0, 'tokens_for_limiter': 0, 'cost': 0.0, 'api_response_time': 0.0, 'attempts': 0}
         else:
             api_model = model or self.config.embedding_model
