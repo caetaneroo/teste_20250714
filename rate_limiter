@@ -6,19 +6,26 @@ from typing import Deque, Tuple, Callable, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-# --- Constantes de Configuração para o Rate Limiter Dinâmico ---
+# --- Constantes de Configuração para o Rate Limiter Inteligente ---
 WINDOW_SECONDS = 60.0
 METRICS_HISTORY_SIZE = 100
 DEFAULT_PREDICTED_COST = 1500
 TPM_TARGET_FACTOR = 0.90
-ADJUSTMENT_COOLDOWN_SECONDS = 5.0
-# Fator para determinar se a latência está aumentando de forma preocupante
-LATENCY_INCREASE_THRESHOLD_FACTOR = 1.5
+# Cooldown entre ajustes para evitar oscilações.
+ADJUSTMENT_COOLDOWN_SECONDS = 10.0
+# Limites de segurança para a concorrência.
+MIN_CONCURRENCY = 2
+MAX_CONCURRENCY = 1000
+# Limiar para evitar ajustes triviais e spam de logs.
+MIN_ADJUSTMENT_STEP = 5
+# Fator para detectar aumento de latência. Se a latência subir 30%, é um sinal.
+LATENCY_INCREASE_FACTOR = 1.3
 
 class AdaptiveRateLimiter:
     """
-    Um governador de vazão que gerencia dinamicamente a concorrência e a taxa de
-    requisições, considerando tanto o limite de TPM quanto a latência da API.
+    Um governador de vazão (throughput governor) que gerencia dinamicamente a
+    concorrência, considerando tanto o limite de TPM quanto a latência da API
+    para garantir performance ótima e estável.
     """
 
     def __init__(
@@ -40,17 +47,16 @@ class AdaptiveRateLimiter:
         self.recent_request_costs: Deque[int] = deque(maxlen=METRICS_HISTORY_SIZE)
         self.recent_latencies: Deque[float] = deque(maxlen=METRICS_HISTORY_SIZE)
         self._avg_request_cost: float = DEFAULT_PREDICTED_COST
-        self._avg_latency: float = 1.0  # Inicia com um valor base
+        self._avg_latency: float = 1.0  # Inicia com um valor base razoável.
 
         # --- Estado do Controle de Concorrência ---
         self._semaphore = asyncio.Semaphore(initial_concurrency)
         self.dynamic_concurrency = initial_concurrency
         self._is_adjusting_semaphore = False
         self._last_adjustment_time: float = 0.0
-        self._last_proactive_pause_log_time: float = 0.0
 
         logger.info(
-            "AdaptiveRateLimiter (Throughput Governor) inicializado",
+            "AdaptiveRateLimiter (Latency-Aware Governor) inicializado",
             extra={'action': 'rate_limiter_init', 'max_tpm': self.effective_max_tpm,
                    'initial_concurrency': self.dynamic_concurrency}
         )
@@ -70,35 +76,25 @@ class AdaptiveRateLimiter:
             self._prune_usage_window()
             target_tpm = self.effective_max_tpm * TPM_TARGET_FACTOR
             if self.tokens_in_window >= target_tpm:
-                now = time.time()
-                wait_time = (WINDOW_SECONDS - (now - self.token_usage_window[0][0])) if self.token_usage_window else 0
-                
+                wait_time = (WINDOW_SECONDS - (time.time() - self.token_usage_window[0][0])) if self.token_usage_window else 0
                 if wait_time > 0:
-                    # Aplica cooldown para não spammar o log
-                    if (now - self._last_proactive_pause_log_time) > ADJUSTMENT_COOLDOWN_SECONDS:
-                        logger.warning(
-                            f"Limite de TPM se aproximando. Pausa proativa de {wait_time:.2f}s.",
-                            extra={'action': 'proactive_pause', 'wait_time': wait_time}
-                        )
-                        self._last_proactive_pause_log_time = now
                     self._stats_callback({'event_type': 'proactive_pause', 'wait_time': wait_time}, batch_id)
                     await asyncio.sleep(wait_time)
 
     def record_request_completion(self, tokens_used: int, success: bool, latency: float, batch_id: Any = None):
-        """Registra o resultado e libera o slot do semáforo, agora aceitando latência."""
+        """Registra o resultado e libera o slot do semáforo, aceitando latência como um sinal vital."""
         try:
-            self._semaphore.release()
+            self.semaphore.release()
         except ValueError:
-            pass # Ignora erro se a capacidade for reduzida
+            pass # Ignora erro de forma segura se a capacidade for reduzida.
         asyncio.create_task(self._async_process_result(tokens_used, success, latency, batch_id))
 
     async def _async_process_result(self, tokens_used: int, success: bool, latency: float, batch_id: Any):
-        """Processa o resultado, atualiza métricas e ajusta a concorrência."""
+        """Processa o resultado, atualiza métricas e ajusta a concorrência de forma inteligente."""
         async with self._lock:
             if success:
                 if tokens_used > 0:
-                    now = time.time()
-                    self.token_usage_window.append((now, tokens_used))
+                    self.token_usage_window.append((time.time(), tokens_used))
                     self.tokens_in_window += tokens_used
                     self.recent_request_costs.append(tokens_used)
                     self._avg_request_cost = sum(self.recent_request_costs) / len(self.recent_request_costs)
@@ -114,36 +110,46 @@ class AdaptiveRateLimiter:
         await self._adjust_concurrency_strategy(latency)
 
     async def _adjust_concurrency_strategy(self, current_latency: float):
-        """Define a nova estratégia de concorrência com base no TPM e na latência."""
-        if self._is_adjusting_semaphore or (time.time() - self._last_adjustment_time < ADJUSTMENT_COOLDOWN_SECONDS):
+        """Define a nova estratégia de concorrência com base no TPM e, crucialmente, na latência."""
+        now = time.time()
+        if self._is_adjusting_semaphore or (now - self._last_adjustment_time < ADJUSTMENT_COOLDOWN_SECONDS):
             return
 
         if self._avg_request_cost <= 0:
             return
 
-        # Lógica de controle de concorrência baseada em latência
-        if current_latency > self._avg_latency * LATENCY_INCREASE_THRESHOLD_FACTOR:
-            # Latência está subindo, sinal de saturação. Não aumenta a concorrência.
-            logger.warning(
-                f"Latência da API ({current_latency:.2f}s) acima da média ({self._avg_latency:.2f}s). "
-                "Pausando aumento de concorrência para evitar sobrecarga.",
-                extra={'action': 'latency_backoff'}
-            )
+        # 1. Verificação de Saúde por Latência (Redução de Concorrência)
+        if current_latency > self._avg_latency * LATENCY_INCREASE_FACTOR and len(self.recent_latencies) > 10:
+            # Latência está subindo, sinal de saturação. Reduz a concorrência para aliviar.
+            new_concurrency = max(MIN_CONCURRENCY, int(self.dynamic_concurrency * 0.8)) # Redução de 20%
+            if new_concurrency < self.dynamic_concurrency:
+                logger.warning(
+                    f"Latência da API ({current_latency:.2f}s) aumentou significativamente acima da média ({self._avg_latency:.2f}s). "
+                    f"Reduzindo concorrência para {new_concurrency} para estabilizar.",
+                    extra={'action': 'latency_backoff', 'current_latency': current_latency, 'avg_latency': self._avg_latency}
+                )
+                await self._set_concurrency(new_concurrency)
             return
 
+        # 2. Ajuste por TPM (Aumento de Concorrência)
         target_tpm = self.effective_max_tpm * TPM_TARGET_FACTOR
         ideal_concurrency = int(target_tpm / self._avg_request_cost)
-        ideal_concurrency = max(1, ideal_concurrency)
+        ideal_concurrency = max(MIN_CONCURRENCY, min(ideal_concurrency, MAX_CONCURRENCY))
+
+        # 3. Limiar de Mudança para Evitar Spam de Logs
+        if abs(ideal_concurrency - self.dynamic_concurrency) < MIN_ADJUSTMENT_STEP:
+            return
 
         await self._set_concurrency(ideal_concurrency)
 
     async def _set_concurrency(self, new_capacity: int):
         """Ajusta a capacidade do semáforo de forma atômica e segura."""
+        if self._is_adjusting_semaphore: return
         self._is_adjusting_semaphore = True
+        
         try:
             async with self._lock:
-                if new_capacity == self.dynamic_concurrency:
-                    return
+                if new_capacity == self.dynamic_concurrency: return
 
                 logger.info(
                     f"Ajustando nível de concorrência de {self.dynamic_concurrency} para {new_capacity}",
@@ -169,7 +175,7 @@ class AdaptiveRateLimiter:
 
     async def _async_handle_rate_limit_error(self, wait_time: float, batch_id: Any):
         """Processa o erro de rate limit, reduzindo drasticamente a concorrência."""
-        logger.error(f"RATE LIMIT DA API DETECTADO! Concorrência será reduzida. Pausando por {wait_time:.1f}s.")
-        new_concurrency = max(1, int(self.dynamic_concurrency / 2))
+        logger.error(f"RATE LIMIT DA API DETECTADO! Reduzindo concorrência e pausando por {wait_time:.1f}s.")
+        new_concurrency = max(MIN_CONCURRENCY, int(self.dynamic_concurrency / 2))
         await self._set_concurrency(new_concurrency)
         self._stats_callback({'event_type': 'api_rate_limit_detected', 'wait_time': wait_time}, batch_id)
