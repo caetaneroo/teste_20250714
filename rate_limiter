@@ -84,7 +84,8 @@ class AdaptiveRateLimiter:
     def record_request_completion(self, tokens_used: int, success: bool, latency: float, batch_id: Any = None):
         """Registra o resultado e libera o slot do semáforo, aceitando latência como um sinal vital."""
         try:
-            self.semaphore.release()
+            # CORREÇÃO: Usando o nome correto do atributo, `self._semaphore`.
+            self._semaphore.release()
         except ValueError:
             pass # Ignora erro de forma segura se a capacidade for reduzida.
         asyncio.create_task(self._async_process_result(tokens_used, success, latency, batch_id))
@@ -120,11 +121,10 @@ class AdaptiveRateLimiter:
 
         # 1. Verificação de Saúde por Latência (Redução de Concorrência)
         if current_latency > self._avg_latency * LATENCY_INCREASE_FACTOR and len(self.recent_latencies) > 10:
-            # Latência está subindo, sinal de saturação. Reduz a concorrência para aliviar.
-            new_concurrency = max(MIN_CONCURRENCY, int(self.dynamic_concurrency * 0.8)) # Redução de 20%
+            new_concurrency = max(MIN_CONCURRENCY, int(self.dynamic_concurrency * 0.8))
             if new_concurrency < self.dynamic_concurrency:
                 logger.warning(
-                    f"Latência da API ({current_latency:.2f}s) aumentou significativamente acima da média ({self._avg_latency:.2f}s). "
+                    f"Latência da API ({current_latency:.2f}s) aumentou significativamente. "
                     f"Reduzindo concorrência para {new_concurrency} para estabilizar.",
                     extra={'action': 'latency_backoff', 'current_latency': current_latency, 'avg_latency': self._avg_latency}
                 )
