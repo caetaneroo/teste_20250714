@@ -14,18 +14,23 @@ ADJUSTMENT_COOLDOWN_SECONDS = 5.0
 MIN_CONCURRENCY = 5
 MAX_CONCURRENCY = 1000
 
-# --- Parâmetros do Algoritmo de Controle de Gradiente ---
-# Aumento agressivo da concorrência quando o sistema está saudável.
-MULTIPLICATIVE_INCREASE_FACTOR = 1.2  # Aumenta a concorrência em 20%.
-# Redução rápida da concorrência em caso de sobrecarga.
-MULTIPLICATIVE_DECREASE_FACTOR = 0.8  # Reduz a concorrência para 80% da atual.
-# Limiar para considerar uma mudança de latência ou vazão como significativa.
-PERFORMANCE_CHANGE_THRESHOLD = 0.05  # Mudança de 5% é considerada relevante.
+# --- Parâmetros do Algoritmo de Controle de Gradiente Aprimorado ---
+# Aumento agressivo quando o sistema está saudável.
+MULTIPLICATIVE_INCREASE_FACTOR = 1.2
+# Aumento conservador quando a latência começa a subir.
+ADDITIVE_INCREASE_STEP = 5
+# Redução rápida em caso de sobrecarga.
+MULTIPLICATIVE_DECREASE_FACTOR = 0.8
+# Limiar para considerar uma mudança de latência como significativa. Aumentado para 10% para reduzir a sensibilidade.
+PERFORMANCE_CHANGE_THRESHOLD = 0.10
+# Limiar para detectar o fim de um lote pela queda na vazão.
+THROUGHPUT_DROP_THRESHOLD = -0.25
 
 class AdaptiveRateLimiter:
     """
-    Um governador de vazão que utiliza um algoritmo de controle de gradiente
-    para otimizar a concorrência, balanceando latência e vazão (throughput).
+    Um governador de vazão que utiliza um algoritmo de controle de gradiente aprimorado
+    para otimizar a concorrência, balanceando latência e vazão (throughput) de forma
+    mais estável e inteligente.
     """
 
     def __init__(
@@ -58,7 +63,7 @@ class AdaptiveRateLimiter:
         self._in_backoff_cooldown = False
 
         logger.info(
-            "AdaptiveRateLimiter (Gradient-Aware Governor) inicializado",
+            "AdaptiveRateLimiter (Advanced Governor) inicializado",
             extra={'action': 'rate_limiter_init', 'max_tpm': self.effective_max_tpm,
                    'initial_concurrency': self.dynamic_concurrency}
         )
@@ -72,41 +77,51 @@ class AdaptiveRateLimiter:
         # Filtra os timestamps de conclusão para a janela de cálculo de vazão (ex: últimos 10s)
         recent_completions = [t for t in self.request_completion_times if now - t <= 10.0]
         if recent_completions:
-            self._avg_throughput = len(recent_completions) / 10.0
+            # Garante que a janela de tempo seja no mínimo 1 para evitar divisão por zero
+            time_window = max(1.0, 10.0 if len(recent_completions) > 1 else 1.0)
+            self._avg_throughput = len(recent_completions) / time_window
         else:
             self._avg_throughput = 0.0
 
     async def await_permission_to_proceed(self, batch_id: Any = None) -> None:
+        """Adquire permissão do semáforo e verifica os limites de TPM."""
         await self._semaphore.acquire()
         async with self._lock:
             now = time.time()
+            # Limpa tokens antigos da janela de observação
             while self.token_usage_window and (now - self.token_usage_window[0][0] > WINDOW_SECONDS):
-                self.token_usage_window.popleft()
+                timestamp, tokens = self.token_usage_window.popleft()
+                self.tokens_in_window -= tokens
             
-            self.tokens_in_window = sum(t[1] for t in self.token_usage_window)
             target_tpm = self.effective_max_tpm * TPM_TARGET_FACTOR
             if self.tokens_in_window >= target_tpm:
                 wait_time = (WINDOW_SECONDS - (now - self.token_usage_window[0][0])) if self.token_usage_window else 0
                 if wait_time > 0:
+                    logger.warning(f"Limite de TPM proativo atingido. Pausando por {wait_time:.2f}s.")
                     self._stats_callback({'event_type': 'proactive_pause', 'wait_time': wait_time}, batch_id)
                     await asyncio.sleep(wait_time)
 
     def record_request_completion(self, tokens_used: int, success: bool, latency: float, batch_id: Any = None):
+        """Libera o semáforo de forma segura e agenda o processamento do resultado."""
         try:
             self._semaphore.release()
         except ValueError:
+            # Proteção para evitar que uma liberação extra do semáforo quebre a aplicação.
+            logger.warning("Tentativa de liberar semáforo já liberado. Ignorando.")
             pass
         asyncio.create_task(self._async_process_result(tokens_used, success, latency, batch_id))
 
     async def _async_process_result(self, tokens_used: int, success: bool, latency: float, batch_id: Any):
+        """Processa o resultado de uma requisição e aciona a estratégia de ajuste."""
         previous_avg_latency = self._avg_latency
         previous_avg_throughput = self._avg_throughput
 
         async with self._lock:
             if success:
-                self.token_usage_window.append((time.time(), tokens_used))
+                now = time.time()
+                self.token_usage_window.append((now, tokens_used))
                 self.tokens_in_window += tokens_used
-                self.request_completion_times.append(time.time())
+                self.request_completion_times.append(now)
                 self.recent_latencies.append(latency)
             
             self._update_performance_metrics()
@@ -116,73 +131,93 @@ class AdaptiveRateLimiter:
         await self._gradient_concurrency_strategy(success, previous_avg_latency, previous_avg_throughput)
 
     async def _gradient_concurrency_strategy(self, success: bool, prev_latency: float, prev_throughput: float):
-        """Ajusta a concorrência com base na 'derivada' da performance (latência vs. vazão)."""
+        """Ajusta a concorrência com base em uma análise mais robusta da performance."""
         now = time.time()
         if self._is_adjusting_semaphore or (now - self._last_adjustment_time < ADJUSTMENT_COOLDOWN_SECONDS):
             return
 
-        # --- Multiplicative Decrease (Redução Agressiva) ---
         latency_change = (self._avg_latency - prev_latency) / prev_latency if prev_latency > 0 else 0
         throughput_change = (self._avg_throughput - prev_throughput) / prev_throughput if prev_throughput > 0 else 0
 
-        # Reduz se a requisição falhou OU se a latência aumentou sem um ganho compensatório de vazão.
-        if not success or (latency_change > PERFORMANCE_CHANGE_THRESHOLD and latency_change > throughput_change):
+        # --- Lógica de Decisão ---
+
+        # 1. CONDIÇÃO DE REDUÇÃO (SOBRECARGA):
+        # Reduz se uma requisição falhou OU se a latência aumentou desproporcionalmente à vazão.
+        is_overloaded = not success or (
+            latency_change > PERFORMANCE_CHANGE_THRESHOLD and latency_change > throughput_change
+        )
+        if is_overloaded:
             new_concurrency = max(MIN_CONCURRENCY, int(self.dynamic_concurrency * MULTIPLICATIVE_DECREASE_FACTOR))
             if new_concurrency < self.dynamic_concurrency:
                 logger.warning(
-                    f"Sinal de sobrecarga detectado (latência subiu mais que a vazão). "
-                    f"Reduzindo concorrência para {new_concurrency}.",
-                    extra={'action': 'gradient_decrease', 'latency_change': latency_change, 'throughput_change': throughput_change}
+                    f"Sinal de sobrecarga. Reduzindo concorrência: {self.dynamic_concurrency} -> {new_concurrency}",
+                    extra={'action': 'decrease_concurrency', 'latency_change': f"{latency_change:.2%}", 'throughput_change': f"{throughput_change:.2%}"}
                 )
                 await self._set_concurrency(new_concurrency)
-                self._in_backoff_cooldown = True
+                self._in_backoff_cooldown = True # Ativa o cooldown para estabilizar
             return
 
-        # --- Multiplicative Increase (Aumento Agressivo) ---
+        # Durante o cooldown, não tenta aumentar a concorrência.
         if self._in_backoff_cooldown:
             if now - self._last_adjustment_time > ADJUSTMENT_COOLDOWN_SECONDS * 2:
-                self._in_backoff_cooldown = False
+                self._in_backoff_cooldown = False # Cooldown finalizado
             else:
                 return 
 
-        new_concurrency = min(MAX_CONCURRENCY, int(self.dynamic_concurrency * MULTIPLICATIVE_INCREASE_FACTOR))
-        # Garante que o aumento seja de pelo menos 1 para não estagnar.
-        if new_concurrency <= self.dynamic_concurrency:
-            new_concurrency = self.dynamic_concurrency + 1
+        # 2. HEURÍSTICA DE FIM DE LOTE:
+        # Se a vazão caiu drasticamente, é provável que o trabalho esteja acabando.
+        # Nesse caso, evitamos ajustes para não confundir falta de trabalho com problema de performance.
+        if throughput_change < THROUGHPUT_DROP_THRESHOLD and len(self.request_completion_times) > 20:
+            logger.info("Queda de vazão detectada, possível fim de lote. Mantendo concorrência estável.")
+            self._last_adjustment_time = now # Reseta o timer para evitar ajustes imediatos
+            return
 
+        # 3. CONDIÇÃO DE AUMENTO (SISTEMA SAUDÁVEL):
+        # Aumenta agressivamente se a latência estiver estável ou melhorando.
+        if latency_change <= PERFORMANCE_CHANGE_THRESHOLD:
+            new_concurrency = min(MAX_CONCURRENCY, int(self.dynamic_concurrency * MULTIPLICATIVE_INCREASE_FACTOR) + 1)
+        else:
+            # Aumenta de forma conservadora (linear) se a latência estiver subindo, mas sem sobrecarga.
+            new_concurrency = min(MAX_CONCURRENCY, self.dynamic_concurrency + ADDITIVE_INCREASE_STEP)
+        
         if new_concurrency > self.dynamic_concurrency:
             await self._set_concurrency(new_concurrency)
 
     async def _set_concurrency(self, new_capacity: int):
+        """Ajusta o tamanho do semáforo de forma segura."""
         if self._is_adjusting_semaphore: return
         self._is_adjusting_semaphore = True
         try:
-            async with self._lock:
-                if new_capacity == self.dynamic_concurrency: return
-                
-                logger.info(
-                    f"Ajustando nível de concorrência de {self.dynamic_concurrency} para {new_capacity}",
-                    extra={'action': 'concurrency_adjustment', 'old_concurrency': self.dynamic_concurrency, 'new_concurrency': new_capacity}
-                )
-                
-                diff = new_capacity - self.dynamic_concurrency
-                if diff > 0:
-                    for _ in range(diff): self._semaphore.release()
-                elif diff < 0:
-                    tasks = [asyncio.create_task(self._semaphore.acquire()) for _ in range(abs(diff))]
-                    await asyncio.gather(*tasks)
+            current_concurrency = self.dynamic_concurrency
+            if new_capacity == current_concurrency: return
+            
+            logger.info(
+                f"Ajustando nível de concorrência: {current_concurrency} -> {new_capacity}",
+                extra={'action': 'concurrency_adjustment', 'old': current_concurrency, 'new': new_capacity}
+            )
+            
+            diff = new_capacity - current_concurrency
+            if diff > 0:
+                for _ in range(diff): self._semaphore.release()
+            elif diff < 0:
+                # Adquire os slots extras para reduzir a capacidade.
+                # Esta operação é bloqueante e pode ser lenta sob carga, mas é necessária.
+                tasks = [asyncio.create_task(self._semaphore.acquire()) for _ in range(abs(diff))]
+                await asyncio.gather(*tasks)
 
-                self.dynamic_concurrency = new_capacity
-                self._last_adjustment_time = time.time()
-                self._stats_callback({'event_type': 'concurrency_update', 'new_concurrency': self.dynamic_concurrency}, None)
+            self.dynamic_concurrency = new_capacity
+            self._last_adjustment_time = time.time()
+            self._stats_callback({'event_type': 'concurrency_update', 'new_concurrency': new_capacity}, None)
         finally:
             self._is_adjusting_semaphore = False
 
     def record_api_rate_limit(self, wait_time: float, batch_id: Any = None):
+        """Reage a um erro de rate limit explícito da API."""
         asyncio.create_task(self._async_handle_rate_limit_error(wait_time, batch_id))
 
     async def _async_handle_rate_limit_error(self, wait_time: float, batch_id: Any):
-        logger.error(f"RATE LIMIT DA API DETECTADO! Reduzindo concorrência e pausando por {wait_time:.1f}s.")
+        """Reduz a concorrência agressivamente em resposta a um erro 429 da API."""
+        logger.error(f"RATE LIMIT EXPLÍCITO DA API! Reduzindo concorrência e pausando por {wait_time:.1f}s.")
         new_concurrency = max(MIN_CONCURRENCY, int(self.dynamic_concurrency * MULTIPLICATIVE_DECREASE_FACTOR))
         await self._set_concurrency(new_concurrency)
         self._in_backoff_cooldown = True
