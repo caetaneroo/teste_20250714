@@ -10,8 +10,6 @@ from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
-# Fuso horário de referência para os relatórios.
-# Usar a base de dados IANA ('America/Sao_Paulo') é a prática recomendada.
 BR_TIMEZONE = ZoneInfo("America/Sao_Paulo")
 
 @dataclass
@@ -51,7 +49,13 @@ class StatsContainer:
     total_proactive_wait_time: float = 0.0
     peak_tpm: int = 0
     
-    # --- Propriedades Calculadas ---
+    # --- INÍCIO DA CORREÇÃO ---
+    @property
+    def total_tokens(self) -> int:
+        """Calcula a soma total de tokens de entrada e saída."""
+        return self.total_input_tokens + self.total_output_tokens
+    # --- FIM DA CORREÇÃO ---
+
     @property
     def processing_time(self) -> float:
         """Tempo real decorrido do início ao fim (tempo de relógio)."""
@@ -100,23 +104,19 @@ class StatsContainer:
             return self.total_requests / processing_time
         return 0.0
 
-    # --- Propriedades para Timestamps Formatados com Milissegundos ---
     @staticmethod
     def _format_timestamp(timestamp: Optional[float]) -> str:
-        """Converte um timestamp Unix para uma string formatada com milissegundos."""
         if not timestamp:
             return "N/A"
         dt_object = datetime.fromtimestamp(timestamp, tz=BR_TIMEZONE)
-        return dt_object.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] # Formata e trunca para 3 casas decimais
+        return dt_object.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
 
     @property
     def start_time_formatted(self) -> str:
-        """Retorna o timestamp de início formatado."""
         return self._format_timestamp(self.start_time)
 
     @property
     def end_time_formatted(self) -> str:
-        """Retorna o timestamp de fim formatado."""
         return self._format_timestamp(self.end_time)
 
 
@@ -138,7 +138,6 @@ class StatsManager:
         stats.total_requests += 1
         if kwargs.get('success', False):
             stats.successful_requests += 1
-            # **CORREÇÃO:** O custo só é adicionado em caso de sucesso.
             stats.total_cost += kwargs.get('cost', 0.0)
             stats.total_input_tokens += kwargs.get('input_tokens', 0)
             stats.total_output_tokens += kwargs.get('output_tokens', 0)
@@ -162,8 +161,6 @@ class StatsManager:
         """Registra eventos do RateLimiter, como pausas e detecção de limites."""
         event_type = event.get('event_type')
         async with self._lock:
-            # **CORREÇÃO:** O `_get_relevant_containers` garante que a métrica
-            # seja aplicada tanto no global quanto no lote específico.
             for stats in self._get_relevant_containers(batch_id):
                 if event_type == 'proactive_pause':
                     stats.proactive_pauses += 1
@@ -187,7 +184,8 @@ class StatsManager:
         """Registra o fim de uma requisição."""
         async with self._lock:
             for stats in self._get_relevant_containers(batch_id):
-                stats.current_concurrent_requests -= 1
+                # Garante que o contador não fique negativo
+                stats.current_concurrent_requests = max(0, stats.current_concurrent_requests - 1)
 
     def _get_relevant_containers(self, batch_id: Optional[str]) -> List[StatsContainer]:
         """Retorna uma lista de containers de estatísticas relevantes (global e, se houver, do lote)."""
@@ -213,68 +211,3 @@ class StatsManager:
     def get_global_stats(self) -> StatsContainer:
         """Retorna o objeto de estatísticas globais."""
         return self._global_stats
-
-    def _format_stats(self, stats: StatsContainer, title: str) -> str:
-        """Formata um contêiner de estatísticas em um relatório legível e rico em insights."""
-        header = f" RELATÓRIO DE PERFORMANCE: {title.upper()} ".center(80, "=")
-        
-        summary = (
-            f"📊 RESUMO GERAL:\n"
-            f"   - Requisições: {stats.total_requests} (✅ {stats.successful_requests} Sucesso | ❌ {stats.failed_requests} Falhas)\n"
-            f"   - Início: {stats.start_time_formatted}\n"
-            f"   - Fim:    {stats.end_time_formatted}\n"
-            f"   - Duração: {stats.processing_time:.3f}s\n"
-        )
-        
-        # A seção de paralelização só faz sentido se houver mais de uma requisição.
-        parallelization = ""
-        if stats.total_requests > 1:
-            parallelization = (
-                f"🚀 EFICIÊNCIA DA PARALELIZAÇÃO:\n"
-                f"   - Tempo Total de API (Serial): {stats.total_api_time:.3f}s\n"
-                f"   - Ganho com Paralelização: {stats.parallelization_gain_seconds:.3f}s ({stats.parallelization_gain_percent:.1f}% de economia de tempo)\n"
-                f"   - Vazão (Throughput): {stats.requests_per_second:.2f} reqs/s\n"
-            )
-
-        # Evita divisão por zero se max_tpm não for definido.
-        tpm_usage_percent = (stats.peak_tpm / self.max_tpm * 100) if self.max_tpm > 0 else 0
-        performance = (
-            f"⏱️ DESEMPENHO E LATÊNCIA:\n"
-            f"   - Latência API (min/média/max): {stats.min_api_latency:.3f}s / {stats.avg_api_latency:.3f}s / {stats.max_api_latency:.3f}s\n"
-            f"   - Pico de Concorrência (Real): {stats.concurrent_peak} requisições\n"
-            f"   - Pico de Consumo TPM: {stats.peak_tpm:,} / {self.max_tpm:,} ({tpm_usage_percent:.1f}% do limite)\n"
-        )
-
-        total_tokens = stats.total_input_tokens + stats.total_output_tokens
-        cost_consumption = (
-            f"💰 CUSTO E CONSUMO DE TOKENS:\n"
-            f"   - Custo Total Estimado: ${stats.total_cost:.4f}\n"
-            f"   - Tokens Totais: {total_tokens:,} (Input: {stats.total_input_tokens:,}, Output: {stats.total_output_tokens:,}, Cache: {stats.total_cached_tokens:,})\n"
-        )
-
-        reliability = (
-            f"🛡️ CONFIABILIDADE E RATE LIMITER:\n"
-            f"   - Retries Totais: {stats.total_retry_count}\n"
-            f"   - Erros de Rate Limit da API: {stats.api_rate_limits_detected}\n"
-            f"   - Pausas Proativas: {stats.proactive_pauses} (totalizando {stats.total_proactive_wait_time:.3f}s)\n"
-        )
-
-        footer = "=" * 80
-        
-        return (f"\n{header}\n{summary}\n{parallelization}\n{performance}\n{cost_consumption}\n{reliability}\n{footer}\n")
-
-    def get_summary(self, batch_id: Optional[str] = None) -> str:
-        """
-        Retorna uma string formatada com o resumo completo das estatísticas
-        para um lote específico ou para as estatísticas globais.
-        """
-        title = "GLOBAL"
-        if batch_id:
-            stats_obj = self._batch_stats.get(batch_id)
-            title = f"LOTE '{batch_id}'"
-            if not stats_obj:
-                return f"Erro: Nenhuma estatística encontrada para o lote com ID '{batch_id}'."
-        else:
-            stats_obj = self._global_stats
-        
-        return self._format_stats(stats_obj, title)
