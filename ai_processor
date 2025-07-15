@@ -1,4 +1,3 @@
-
 import asyncio
 import time
 import json
@@ -12,7 +11,7 @@ from typing import List, Dict, Any, Optional, Callable
 from dataclasses import dataclass
 
 from tenacity import AsyncRetrying, RetryError, stop_after_attempt, wait_fixed
-from iaragenai import AsyncIaraGenAI  # Substitua pelo seu cliente de API real
+from iaragenai import AsyncIaraGenAI
 
 import rate_limiter
 import stats_manager
@@ -33,8 +32,8 @@ class AIProcessorConfig:
     """Configuração validada para o AIProcessor."""
     client_id: str
     client_secret: str
-    model: str = "gpt-4o-mini"  # Modelo padrão para chat
-    embedding_model: str = "text-embedding-ada-002"  # Modelo padrão para embeddings
+    model: str = "gpt-4o-mini"
+    embedding_model: str = "text-embedding-ada-002"
     temperature: float = DEFAULT_TEMPERATURE
     max_tokens: Optional[int] = None
     max_tpm: int = DEFAULT_MAX_TPM
@@ -43,7 +42,7 @@ class AIProcessorConfig:
     environment: str = "dev"
     provider: str = "azure_openai"
     correlation_id: str = "ai-processor-final"
-    enable_embedding_cache: bool = False  # Ativa cache simples para embeddings
+    enable_embedding_cache: bool = False
 
 def load_models_config(config_path: str = "models.json") -> Dict[str, Any]:
     """Carrega a configuração dos modelos a partir de um arquivo JSON no diretório do módulo."""
@@ -112,10 +111,8 @@ class AIProcessor:
     def __init__(self, config: AIProcessorConfig):
         self.models_config = load_models_config()
         self.supported_models = set(self.models_config.keys())
-        
         self.config = config
         
-        # Cria o cliente da API internamente usando os parâmetros da config
         self.client = AsyncIaraGenAI(
             client_id=self.config.client_id,
             client_secret=self.config.client_secret,
@@ -137,46 +134,38 @@ class AIProcessor:
         
         self.embedding_cache: Optional[Dict[str, List[float]]] = {} if self.config.enable_embedding_cache else None
         
-        logger.info("AIProcessor inicializado com suporte a embeddings",
-                    extra={'action': 'ai_processor_init', 'model': self.config.model, 'embedding_model': self.config.embedding_model,
-                           'max_tpm': self.config.max_tpm, 'json_schema_supported': self._supports_json_schema(self.config.model)})
+        logger.info("AIProcessor inicializado",
+                    extra={'action': 'ai_processor_init', 'model': self.config.model, 'embedding_model': self.config.embedding_model})
 
     def _get_model_pricing(self, model: str) -> Dict[str, float]:
-        """Recupera os preços de um modelo a partir da configuração carregada."""
         model_data = self.models_config.get(model, {})
         return {'input': model_data.get('input', 0.0), 'output': model_data.get('output', 0.0), 'cache': model_data.get('cache', 0.0)}
 
     def _calculate_cost(self, model: str, input_tokens: int, output_tokens: int = 0, cached_tokens: int = 0) -> float:
-        """Calcula o custo de uma chamada de API com base nos tokens usados."""
         pricing = self._get_model_pricing(model)
         regular_input = max(0, input_tokens - cached_tokens)
         return ((regular_input / 1000) * pricing['input'] + (cached_tokens / 1000) * pricing['cache'] + (output_tokens / 1000) * pricing['output'])
 
     def _create_stats_callback(self) -> Callable:
-        """Cria um callback para o RateLimiter enviar eventos ao StatsManager."""
         def callback(event: Dict[str, Any], batch_id: Optional[str] = None):
             asyncio.create_task(self.stats_manager.record_rate_limiter_event(event, batch_id))
         return callback
 
     def _supports_json_schema(self, model: str) -> bool:
-        """Verifica se um modelo suporta o modo de resposta JSON Schema."""
         return self.models_config.get(model, {}).get('json_schema', False)
 
     def _validate_json_schema_compatibility(self, json_schema: Optional[Dict[str, Any]], model: str):
-        """Valida se o modelo selecionado é compatível com o uso de JSON Schema."""
         if json_schema and not self._supports_json_schema(model):
             supported_models = [m for m, cfg in self.models_config.items() if cfg.get('json_schema')]
             raise JSONSchemaNotSupportedError(f"Modelo '{model}' não suporta json_schema. Modelos compatíveis: {', '.join(supported_models)}")
 
     @staticmethod
     def _is_rate_limit_error(result: Dict[str, Any]) -> bool:
-        """Verifica se um resultado de erro é devido a rate limit."""
         if not isinstance(result, dict): return False
         error_msg = result.get('error', '').lower()
         return 'token rate limit' in error_msg or 'rate limit' in error_msg
 
     def _extract_wait_time_from_error(self, result: Dict[str, Any]) -> float:
-        """Extrai o tempo de espera sugerido de um erro de rate limit."""
         headers = result.get('response_headers', {})
         if 'retry-after' in headers:
             try: return float(headers['retry-after'])
@@ -188,7 +177,6 @@ class AIProcessor:
 
     @staticmethod
     def _normalize_ids(ids: Any, total_items: int) -> Optional[List[str]]:
-        """Normaliza uma lista de IDs customizados para garantir consistência."""
         if ids is None: return None
         if hasattr(ids, 'tolist'): id_list = ids.tolist()
         elif hasattr(ids, 'values'): id_list = list(ids.values)
@@ -199,15 +187,12 @@ class AIProcessor:
         return [str(cid) if cid is not None else None for cid in id_list]
 
     def _get_current_timestamp_iso(self) -> str:
-        """Gera um timestamp formatado com milissegundos no fuso horário de Brasília."""
         now = time.time()
         dt_object = datetime.fromtimestamp(now, tz=BR_TIMEZONE)
         return dt_object.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
 
     async def _make_api_call(self, params: Dict[str, Any], request_id: str, batch_id: Optional[str] = None, is_embedding: bool = False) -> Dict[str, Any]:
-        """Função interna para realizar uma chamada à API com retentativas e tratamento de erros."""
         model = params.get('model', self.config.model if not is_embedding else self.config.embedding_model)
-        
         await self.rate_limiter.await_permission_to_proceed(batch_id)
         await self.stats_manager.record_concurrent_start(batch_id)
         
@@ -218,102 +203,135 @@ class AIProcessor:
                     try:
                         if is_embedding:
                             response = await self.client.embeddings.create(**params)
-                            input_tokens = response.usage.prompt_tokens
-                            output_tokens = 0
-                            cached_tokens = 0
                             content = response.data[0].embedding if isinstance(params.get("input"), str) else [emb.embedding for emb in response.data]
+                            input_tokens, output_tokens, cached_tokens = response.usage.prompt_tokens, 0, 0
                         else:
                             self._validate_json_schema_compatibility(params.get('response_format'), model)
                             response = await self.client.chat.completions.create(**params)
-                            input_tokens = response.usage.prompt_tokens
-                            output_tokens = response.usage.completion_tokens
-                            cached_tokens = getattr(getattr(response.usage, 'prompt_tokens_details', {}), 'cached_tokens', 0)
                             content = response.choices[0].message.content
                             if params.get('response_format') and content:
                                 try: content = json.loads(content)
                                 except json.JSONDecodeError: pass
+                            input_tokens, output_tokens = response.usage.prompt_tokens, response.usage.completion_tokens
+                            cached_tokens = getattr(getattr(response.usage, 'prompt_tokens_details', {}), 'cached_tokens', 0)
                         
-                        cost = self._calculate_cost(model, input_tokens, output_tokens, cached_tokens)
-                        total_tokens = input_tokens + output_tokens
-                        tokens_for_limiter = (input_tokens - cached_tokens) + output_tokens
-
                         return {
                             'id': request_id, 'success': True, 'content': content,
                             'input_tokens': input_tokens, 'output_tokens': output_tokens,
-                            'cached_tokens': cached_tokens, 'total_tokens': total_tokens,
-                            'tokens_for_limiter': tokens_for_limiter, 'cost': cost,
+                            'cached_tokens': cached_tokens, 'total_tokens': input_tokens + output_tokens,
+                            'tokens_for_limiter': (input_tokens - cached_tokens) + output_tokens,
+                            'cost': self._calculate_cost(model, input_tokens, output_tokens, cached_tokens),
                             'api_response_time': time.time() - start_time, 'attempts': attempt.retry_state.attempt_number
                         }
                     except Exception as e:
                         error_details = {'type': type(e).__name__, 'message': str(e), 'traceback': traceback.format_exc()}
-                        error_result = {
-                            'id': request_id, 'success': False, 'error': str(e), 'error_details': error_details,
-                            'error_type': type(e).__name__, 'api_response_time': time.time() - start_time,
-                            'attempts': attempt.retry_state.attempt_number,
-                            'response_headers': dict(getattr(e.response, 'headers', {}) if hasattr(e, 'response') else {}),
-                        }
+                        error_result = {'id': request_id, 'success': False, 'error': str(e), 'error_details': error_details, 'error_type': type(e).__name__,
+                                        'api_response_time': time.time() - start_time, 'attempts': attempt.retry_state.attempt_number,
+                                        'response_headers': dict(getattr(e.response, 'headers', {}) if hasattr(e, 'response') else {})}
                         if self._is_rate_limit_error(error_result):
                             wait_time = self._extract_wait_time_from_error(error_result)
                             self.rate_limiter.record_api_rate_limit(wait_time, batch_id)
-                            await self.stats_manager.record_rate_limiter_event(
-                                {'event_type': 'api_rate_limit_detected', 'wait_time': wait_time}, batch_id)
                             raise
                         return error_result
         except RetryError as retry_error:
             last_exception = retry_error.last_attempt.exception()
             error_details = {'type': type(last_exception).__name__, 'message': str(last_exception), 'traceback': traceback.format_exc()}
-            return {
-                'id': request_id, 'success': False, 'error': f'Máximo de {self.config.max_retry} tentativas excedido.',
-                'error_details': error_details, 'error_type': 'RetryError', 'attempts': self.config.max_retry,
-            }
+            return {'id': request_id, 'success': False, 'error': f'Máximo de {self.config.max_retry} tentativas excedido.',
+                    'error_details': error_details, 'error_type': 'RetryError', 'attempts': self.config.max_retry}
         finally:
             await self.stats_manager.record_concurrent_end(batch_id)
 
     def _create_ordered_result(self, result: Dict[str, Any], start_timestamp_iso: str) -> Dict[str, Any]:
-        """Cria um dicionário de resultado final com uma ordem de campos padronizada."""
         base_fields = ['id', 'start_timestamp', 'success', 'api_response_time', 'attempts']
         ordered_result = {k: result.get(k) for k in base_fields}
-
         if result.get('success'):
             success_fields = ['input_tokens', 'output_tokens', 'cached_tokens', 'total_tokens', 'cost', 'content']
             ordered_result.update({k: result.get(k) for k in success_fields})
         else:
             error_fields = ['error', 'error_details']
             ordered_result.update({k: result.get(k) for k in error_fields})
-            
         return ordered_result
 
     async def _process_and_record_result(self, result: Dict[str, Any], model: str, batch_id: Optional[str] = None):
-        """Registra os resultados da chamada no RateLimiter e no StatsManager."""
-        tokens_for_limiter = result.get('tokens_for_limiter', 0)
-        self.rate_limiter.record_request_completion(tokens_for_limiter, result.get('success', False), batch_id)
-        await self.stats_manager.record_request(
-            batch_id=batch_id,
-            model=model,
-            retry_count=max(0, result.get('attempts', 1) - 1),
-            **result
-        )
+        self.rate_limiter.record_request_completion(result.get('tokens_for_limiter', 0), result.get('success', False), batch_id)
+        await self.stats_manager.record_request(batch_id=batch_id, model=model, retry_count=max(0, result.get('attempts', 1) - 1), **result)
 
-    async def process_single(self, text: str, prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
-                             custom_id: Optional[str] = None, model: Optional[str] = None, **kwargs) -> Dict[str, Any]:
-        """Processa um único texto via chat completion."""
-        start_timestamp_iso = self._get_current_timestamp_iso()
-        request_id = custom_id or f"req_{int(time.time() * 1000)}"
-        prompt = prompt_template.format(text=text, **kwargs)
+    async def _run_batch_processor(self, worker_coro: Callable, items: List, batch_id: str, **kwargs):
+        """Função genérica para executar um lote, gerenciando a concorrência local."""
+        # Limita a concorrência para este lote ao menor valor entre o global e o tamanho do lote.
+        effective_concurrency = min(self.config.initial_concurrency, len(items))
+        semaphore = asyncio.Semaphore(effective_concurrency)
         
-        api_model = model or self.config.model
-        params = {"model": api_model, "messages": [{"role": "user", "content": prompt}], "temperature": self.config.temperature}
-        if self.config.max_tokens: params["max_tokens"] = self.config.max_tokens
-        if json_schema: params["response_format"] = {"type": "json_object"}
+        async def sem_worker(item):
+            async with semaphore:
+                return await worker_coro(item, **kwargs)
+
+        tasks = [asyncio.create_task(sem_worker(item)) for item in items]
+        return await asyncio.gather(*tasks)
+
+    async def process_batch(self, texts: List[str], prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
+                            batch_id: Optional[str] = None, custom_ids: Optional[Any] = None, model: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        """Processa uma lista de textos em lote via chat completion."""
+        unique_timestamp = int(time.time())
+        final_batch_id = f"{batch_id}_{unique_timestamp}" if batch_id else f"batch_{unique_timestamp}"
         
-        result = await self._make_api_call(params, request_id)
-        await self._process_and_record_result(result, api_model)
+        self.stats_manager.start_batch(final_batch_id)
+        normalized_ids = self._normalize_ids(custom_ids, len(texts))
         
-        return self._create_ordered_result(result, start_timestamp_iso)
+        logger.info(f"🚀 Iniciando processamento de chat em lote '{final_batch_id}' com {len(texts)} itens.")
+        progress_tracker = self._BatchProgressTracker(total=len(texts), batch_id=final_batch_id)
+        items_to_process = [(i, texts[i], (normalized_ids[i] if normalized_ids else None)) for i in range(len(texts))]
+
+        results = await self._run_batch_processor(
+            self._process_item_in_batch,
+            items_to_process,
+            final_batch_id,
+            prompt_template=prompt_template, json_schema=json_schema,
+            batch_id=final_batch_id, progress_tracker=progress_tracker, model=model, **kwargs
+        )
+        
+        batch_stats = self.stats_manager.end_batch(final_batch_id)
+        logger.info(f"✅ Lote de chat '{final_batch_id}' concluído. {self.get_batch_stats(final_batch_id).get_summary(final_batch_id)}")
+        return {'results': results, 'batch_stats': batch_stats, 'batch_id': final_batch_id}
+
+    async def process_embedding_batch(self, texts: List[str], batch_id: Optional[str] = None,
+                                      custom_ids: Optional[Any] = None, model: Optional[str] = None) -> Dict[str, Any]:
+        """Gera embeddings para uma lista de textos em lote."""
+        unique_timestamp = int(time.time())
+        final_batch_id = f"{batch_id}_{unique_timestamp}" if batch_id else f"embedding_batch_{unique_timestamp}"
+
+        self.stats_manager.start_batch(final_batch_id)
+        normalized_ids = self._normalize_ids(custom_ids, len(texts))
+
+        logger.info(f"🚀 Iniciando processamento de embedding em lote '{final_batch_id}' com {len(texts)} itens.")
+        progress_tracker = self._BatchProgressTracker(total=len(texts), batch_id=final_batch_id)
+        items_to_process = [(i, texts[i], (normalized_ids[i] if normalized_ids else None)) for i in range(len(texts))]
+
+        results = await self._run_batch_processor(
+            self._process_embedding_item,
+            items_to_process,
+            final_batch_id,
+            batch_id=final_batch_id, progress_tracker=progress_tracker, model=model
+        )
+        
+        batch_stats = self.stats_manager.end_batch(final_batch_id)
+        logger.info(f"✅ Lote de embedding '{final_batch_id}' concluído. {self.get_batch_stats(final_batch_id).get_summary(final_batch_id)}")
+        return {'results': results, 'batch_stats': batch_stats, 'batch_id': final_batch_id}
+
+    # --- Métodos de acesso a estatísticas ---
+
+    def get_batch_stats(self, batch_id: str) -> Optional[stats_manager.StatsContainer]:
+        """Retorna o objeto de estatísticas para um lote específico."""
+        return self.stats_manager.get_batch_stats(batch_id)
+
+    def get_global_stats(self) -> stats_manager.StatsContainer:
+        """Retorna o objeto de estatísticas globais."""
+        return self.stats_manager.get_global_stats()
+
+    # --- Funções worker internas para processamento em lote ---
 
     async def _process_item_in_batch(self, item_data: tuple, prompt_template: str, json_schema: Optional[Dict[str, Any]],
                                      batch_id: str, progress_tracker: _BatchProgressTracker, model: Optional[str] = None, **kwargs):
-        """Função worker para processar um item de chat completion dentro de um lote."""
         start_timestamp_iso = self._get_current_timestamp_iso()
         index, text, custom_id = item_data
         request_id = custom_id or f"{batch_id}_req_{index}"
@@ -326,82 +344,24 @@ class AIProcessor:
         
         result = await self._make_api_call(params, request_id, batch_id)
         await self._process_and_record_result(result, api_model, batch_id)
-        
         await progress_tracker.increment_and_log(result.get('total_tokens', 0))
-        
         return self._create_ordered_result(result, start_timestamp_iso)
 
-    async def process_batch(self, texts: List[str], prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
-                            batch_id: Optional[str] = None, custom_ids: Optional[Any] = None, model: Optional[str] = None, **kwargs) -> Dict[str, Any]:
-        """Processa uma lista de textos em lote via chat completion."""
-        unique_timestamp = int(time.time())
-        batch_id = batch_id or f"batch_{unique_timestamp}"
-        self.stats_manager.start_batch(batch_id)
-        normalized_ids = self._normalize_ids(custom_ids, len(texts))
-        
-        logger.info(f"🚀 Iniciando processamento de chat em lote '{batch_id}' com {len(texts)} itens.")
-        
-        progress_tracker = self._BatchProgressTracker(total=len(texts), batch_id=batch_id)
-        
-        tasks = [
-            asyncio.create_task(self._process_item_in_batch((i, texts[i], (normalized_ids[i] if normalized_ids else None)), 
-                                                            prompt_template, json_schema, batch_id, progress_tracker, model=model, **kwargs))
-            for i in range(len(texts))
-        ]
-        
-        results = await asyncio.gather(*tasks)
-        batch_stats = self.stats_manager.end_batch(batch_id)
-        
-        logger.info(f"✅ Lote de chat '{batch_id}' concluído. Sucesso: {batch_stats.successful_requests}, Falhas: {batch_stats.failed_requests}.")
-        
-        return {'results': results, 'batch_stats': batch_stats, 'batch_id': batch_id}
-
     async def _process_embedding_item(self, item_data: tuple, batch_id: str, progress_tracker: _BatchProgressTracker, model: Optional[str] = None):
-        """Função worker para processar um item de embedding dentro de um lote."""
         start_timestamp_iso = self._get_current_timestamp_iso()
         index, text, custom_id = item_data
         request_id = custom_id or f"{batch_id}_emb_{index}"
         
         if self.embedding_cache is not None and text in self.embedding_cache:
-            result = {
-                'id': request_id, 'success': True, 'content': self.embedding_cache[text],
-                'input_tokens': 0, 'output_tokens': 0, 'cached_tokens': 0, 'total_tokens': 0,
-                'tokens_for_limiter': 0, 'cost': 0.0, 'api_response_time': 0.0, 'attempts': 0
-            }
+            result = {'id': request_id, 'success': True, 'content': self.embedding_cache[text], 'input_tokens': 0, 'output_tokens': 0, 
+                      'cached_tokens': 0, 'total_tokens': 0, 'tokens_for_limiter': 0, 'cost': 0.0, 'api_response_time': 0.0, 'attempts': 0}
         else:
             api_model = model or self.config.embedding_model
             params = {"model": api_model, "input": text}
             result = await self._make_api_call(params, request_id, batch_id, is_embedding=True)
-            
             if result.get('success') and self.embedding_cache is not None:
                 self.embedding_cache[text] = result['content']
-            
             await self._process_and_record_result(result, api_model, batch_id)
 
         await progress_tracker.increment_and_log(result.get('total_tokens', 0))
         return self._create_ordered_result(result, start_timestamp_iso)
-
-    async def process_embedding_batch(self, texts: List[str], batch_id: Optional[str] = None,
-                                      custom_ids: Optional[Any] = None, model: Optional[str] = None) -> Dict[str, Any]:
-        """Gera embeddings para uma lista de textos em lote."""
-        unique_timestamp = int(time.time())
-        batch_id = batch_id or f"embedding_batch_{unique_timestamp}"
-        self.stats_manager.start_batch(batch_id)
-        normalized_ids = self._normalize_ids(custom_ids, len(texts))
-
-        logger.info(f"🚀 Iniciando processamento de embedding em lote '{batch_id}' com {len(texts)} itens.")
-
-        progress_tracker = self._BatchProgressTracker(total=len(texts), batch_id=batch_id)
-
-        tasks = [
-            asyncio.create_task(self._process_embedding_item((i, texts[i], (normalized_ids[i] if normalized_ids else None)),
-                                                             batch_id, progress_tracker, model=model))
-            for i in range(len(texts))
-        ]
-
-        results = await asyncio.gather(*tasks)
-        batch_stats = self.stats_manager.end_batch(batch_id)
-        
-        logger.info(f"✅ Lote de embedding '{batch_id}' concluído. Sucesso: {batch_stats.successful_requests}, Falhas: {batch_stats.failed_requests}.")
-
-        return {'results': results, 'batch_stats': batch_stats, 'batch_id': batch_id}
