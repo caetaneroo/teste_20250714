@@ -170,17 +170,14 @@ class AIProcessor:
                 with attempt:
                     start_time = time.time()
                     try:
-                        # Define a chamada de API como uma corrotina
                         if is_embedding:
                             api_coro = self.client.embeddings.create(**params)
                         else:
                             self._validate_json_schema_compatibility(params.get('response_format'), model)
                             api_coro = self.client.chat.completions.create(**params)
                         
-                        # Executa a corrotina com um timeout
                         response = await asyncio.wait_for(api_coro, timeout=API_CALL_TIMEOUT_SECONDS)
                         
-                        # Processa a resposta
                         if is_embedding:
                             content = response.data[0].embedding if isinstance(params.get("input"), str) else [emb.embedding for emb in response.data]
                             input_tokens, output_tokens, cached_tokens = response.usage.prompt_tokens, 0, 0
@@ -202,7 +199,6 @@ class AIProcessor:
                         }
                     except asyncio.TimeoutError:
                         logger.warning(f"API call timed out (> {API_CALL_TIMEOUT_SECONDS}s) for request {request_id}. Retrying...")
-                        # Tenacity automaticamente lida com o retry ao relançar a exceção
                         raise
                     except Exception as e:
                         error_details = {'type': type(e).__name__, 'message': str(e)}
@@ -233,6 +229,11 @@ class AIProcessor:
         return ordered_result
 
     async def _process_and_record_result(self, result: Dict[str, Any], model: str, batch_id: Optional[str] = None):
+        """Processa e registra o resultado, evitando a duplicação de argumentos."""
+        # CORREÇÃO: Cria uma cópia do resultado e remove a chave 'model' antes de desempacotar.
+        result_for_stats = result.copy()
+        result_for_stats.pop('model', None)
+
         self.rate_limiter.record_request_completion(
             tokens_used=result.get('tokens_for_limiter', 0),
             success=result.get('success', False),
@@ -240,7 +241,10 @@ class AIProcessor:
             batch_id=batch_id
         )
         await self.stats_manager.record_request(
-            batch_id=batch_id, model=model, retry_count=max(0, result.get('attempts', 1) - 1), **result
+            batch_id=batch_id, 
+            model=model,  # Passa 'model' explicitamente.
+            retry_count=max(0, result.get('attempts', 1) - 1), 
+            **result_for_stats # Passa o resto dos resultados.
         )
 
     async def _run_batch_processor(self, worker_coro: Callable, items: List, **kwargs):
