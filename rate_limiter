@@ -3,34 +3,48 @@ import time
 import logging
 from collections import deque
 from typing import Deque, Tuple, Callable, Dict, Any, Optional
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-# --- Constantes de Configuração para o Rate Limiter Avançado ---
+# --- Constantes de Configuração Refinadas ---
 WINDOW_SECONDS = 60.0
-METRICS_HISTORY_SIZE = 150
-TPM_TARGET_FACTOR = 0.90
-ADJUSTMENT_COOLDOWN_SECONDS = 5.0
-MIN_CONCURRENCY = 10
-MAX_CONCURRENCY = 1000
+METRICS_HISTORY_SIZE = 100
+TPM_TARGET_FACTOR = 0.85  # Mais conservador
+ADJUSTMENT_COOLDOWN_SECONDS = 8.0  # Mais tempo entre ajustes
+MIN_CONCURRENCY = 5
+MAX_CONCURRENCY = 500  # Reduzido para ser mais realista
 
-# --- Parâmetros do Algoritmo de Controle de Gradiente Aprimorado ---
-MULTIPLICATIVE_INCREASE_FACTOR = 1.2
-ADDITIVE_INCREASE_STEP = 10
-MULTIPLICATIVE_DECREASE_FACTOR = 0.75
-PERFORMANCE_CHANGE_THRESHOLD = 0.15
+# --- Parâmetros do Algoritmo de Controle Baseado em Eficiência ---
+MULTIPLICATIVE_INCREASE_FACTOR = 1.15  # Aumento mais conservador
+ADDITIVE_INCREASE_STEP = 5  # Passos menores
+MULTIPLICATIVE_DECREASE_FACTOR = 0.7  # Redução mais agressiva
+LATENCY_DEGRADATION_THRESHOLD = 0.25  # 25% de aumento na latência é crítico
+EFFICIENCY_IMPROVEMENT_THRESHOLD = 0.05  # 5% de melhoria mínima para justificar aumento
 
-# --- Constantes de Controle de Lógica ---
-# Número de requisições a aguardar antes de avaliar sobrecargas
-WARMUP_REQUESTS_COUNT = 50
-# Intervalo mínimo entre logs de ajuste para evitar spam
-LOGGING_COOLDOWN_SECONDS = 10.0
+# --- Constantes de Controle de Qualidade ---
+WARMUP_REQUESTS_COUNT = 30  # Reduzido para reagir mais rápido
+PERFORMANCE_EVALUATION_WINDOW = 20  # Janela para calcular eficiência
+LOGGING_COOLDOWN_SECONDS = 8.0
+STABILITY_REQUIRED_CYCLES = 3  # Ciclos de estabilidade antes de aumentar
+MAX_LATENCY_ACCEPTABLE = 45.0  # Limite de latência aceitável (segundos)
+
+
+@dataclass
+class PerformanceMetrics:
+    """Métricas de performance consolidadas para análise de eficiência."""
+    avg_latency: float
+    avg_throughput: float
+    efficiency_score: float  # throughput / latency
+    success_rate: float
+    concurrency_level: int
+    timestamp: float
 
 
 class AdaptiveRateLimiter:
     """
-    Um governador de vazão que utiliza um algoritmo de controle de gradiente aprimorado
-    para otimizar a concorrência de forma mais estável e inteligente.
+    Rate limiter inteligente que prioriza EFICIÊNCIA sobre concorrência máxima.
+    Ajusta dinamicamente baseado na relação throughput/latência.
     """
 
     def __init__(
@@ -46,15 +60,18 @@ class AdaptiveRateLimiter:
         self._stats_callback = stats_callback
         self._lock = asyncio.Lock()
 
-        # --- Estado do Controle de Fluxo e Performance ---
+        # --- Estado do Controle de Fluxo ---
         self.token_usage_window: Deque[Tuple[float, int]] = deque()
         self.tokens_in_window: int = 0
         self.request_completion_times: Deque[float] = deque(maxlen=METRICS_HISTORY_SIZE)
         self.recent_latencies: Deque[float] = deque(maxlen=METRICS_HISTORY_SIZE)
+        self.recent_success_flags: Deque[bool] = deque(maxlen=METRICS_HISTORY_SIZE)
 
-        self._avg_latency: float = 1.0
-        self._avg_throughput: float = 0.0
+        # --- Histórico de Performance para Análise de Eficiência ---
+        self.performance_history: Deque[PerformanceMetrics] = deque(maxlen=10)
         self._requests_counted_since_init: int = 0
+        self._successful_requests_recent: int = 0
+        self._stability_counter: int = 0
 
         # --- Estado do Controle de Concorrência ---
         self._semaphore = asyncio.Semaphore(initial_concurrency)
@@ -63,161 +80,308 @@ class AdaptiveRateLimiter:
         self._last_adjustment_time: float = 0.0
         self._last_log_time: float = 0.0
         self._in_backoff_cooldown = False
+        self._rate_limit_detected_recently = False
+
+        # --- Métricas Atuais ---
+        self._current_avg_latency: float = 1.0
+        self._current_avg_throughput: float = 0.0
+        self._current_success_rate: float = 1.0
+        self._current_efficiency_score: float = 0.0
 
         logger.info(
-            "AdaptiveRateLimiter (Intelligent Governor) inicializado",
+            "AdaptiveRateLimiter (Efficiency-Based) inicializado",
             extra={
                 "action": "rate_limiter_init",
                 "max_tpm": self.effective_max_tpm,
                 "initial_concurrency": self.dynamic_concurrency,
+                "max_concurrency": MAX_CONCURRENCY,
             },
         )
 
     def _update_performance_metrics(self):
-        """Calcula a latência e a vazão médias com base no histórico recente."""
-        if self.recent_latencies:
-            self._avg_latency = sum(self.recent_latencies) / len(self.recent_latencies)
-
+        """Atualiza métricas de performance com foco em eficiência."""
         now = time.time()
-        recent_completions = [t for t in self.request_completion_times if now - t <= 10.0]
+        
+        # Calcula latência média dos últimos requests
+        if self.recent_latencies:
+            self._current_avg_latency = sum(self.recent_latencies) / len(self.recent_latencies)
+        
+        # Calcula throughput (requests/segundo) na janela recente
+        recent_window = 15.0  # 15 segundos
+        recent_completions = [t for t in self.request_completion_times if now - t <= recent_window]
         if recent_completions:
-            time_window = max(1.0, 10.0 if len(recent_completions) > 1 else 1.0)
-            self._avg_throughput = len(recent_completions) / time_window
+            self._current_avg_throughput = len(recent_completions) / recent_window
         else:
-            self._avg_throughput = 0.0
+            self._current_avg_throughput = 0.0
+        
+        # Calcula taxa de sucesso
+        if self.recent_success_flags:
+            self._current_success_rate = sum(self.recent_success_flags) / len(self.recent_success_flags)
+        
+        # Calcula score de eficiência (throughput ponderado pela qualidade)
+        if self._current_avg_latency > 0:
+            base_efficiency = self._current_avg_throughput / self._current_avg_latency
+            # Penaliza eficiência se latência for muito alta ou sucesso baixo
+            latency_penalty = max(0.1, 1.0 - (self._current_avg_latency / MAX_LATENCY_ACCEPTABLE))
+            success_penalty = self._current_success_rate
+            self._current_efficiency_score = base_efficiency * latency_penalty * success_penalty
+        else:
+            self._current_efficiency_score = 0.0
+
+    def _should_reject_due_to_tpm_limit(self) -> Tuple[bool, float]:
+        """Verifica se deve rejeitar por limite de TPM e retorna tempo de espera."""
+        now = time.time()
+        # Limpa tokens antigos
+        while self.token_usage_window and (now - self.token_usage_window[0][0] > WINDOW_SECONDS):
+            timestamp, tokens = self.token_usage_window.popleft()
+            self.tokens_in_window -= tokens
+
+        target_tpm = self.effective_max_tpm * TPM_TARGET_FACTOR
+        if self.tokens_in_window >= target_tpm:
+            if self.token_usage_window:
+                wait_time = WINDOW_SECONDS - (now - self.token_usage_window[0][0])
+                return True, max(0.1, wait_time)
+        return False, 0.0
 
     async def await_permission_to_proceed(self, batch_id: Any = None) -> None:
-        """Adquire permissão do semáforo e verifica os limites de TPM."""
+        """Adquire permissão respeitando TPM e concorrência."""
+        # Primeiro verifica TPM
+        should_wait, wait_time = self._should_reject_due_to_tpm_limit()
+        if should_wait:
+            self._maybe_log(f"Limite TPM atingido. Pausando por {wait_time:.2f}s", level="warning")
+            self._stats_callback({"event_type": "tpm_limit_pause", "wait_time": wait_time}, batch_id)
+            await asyncio.sleep(wait_time)
+        
+        # Depois adquire o semáforo
         await self._semaphore.acquire()
-        async with self._lock:
-            now = time.time()
-            # Limpa tokens antigos da janela de observação
-            while self.token_usage_window and (now - self.token_usage_window[0][0] > WINDOW_SECONDS):
-                timestamp, tokens = self.token_usage_window.popleft()
-                self.tokens_in_window -= tokens
-
-            target_tpm = self.effective_max_tpm * TPM_TARGET_FACTOR
-            if self.tokens_in_window >= target_tpm:
-                wait_time = (WINDOW_SECONDS - (now - self.token_usage_window[0][0])) if self.token_usage_window else 0.0
-                if wait_time > 0:
-                    self._maybe_log(f"Limite de TPM proativo atingido. Pausando por {wait_time:.2f}s.", level="warning")
-                    self._stats_callback({"event_type": "proactive_pause", "wait_time": wait_time}, batch_id)
-                    await asyncio.sleep(wait_time)
 
     def record_request_completion(self, tokens_used: int, success: bool, latency: float, batch_id: Any = None, remaining_tasks: Optional[int] = None):
-        """Libera o semáforo de forma segura e agenda o processamento do resultado."""
+        """Registra conclusão de request e libera semáforo."""
         try:
             self._semaphore.release()
         except ValueError:
             pass
-        asyncio.create_task(self._async_process_result(tokens_used, success, latency, batch_id, remaining_tasks))
+        
+        # Processa de forma assíncrona
+        asyncio.create_task(self._async_process_completion(tokens_used, success, latency, batch_id, remaining_tasks))
 
-    async def _async_process_result(self, tokens_used: int, success: bool, latency: float, batch_id: Any, remaining_tasks: Optional[int]):
-        """Processa o resultado de uma requisição e aciona a estratégia de ajuste."""
-        previous_avg_latency = self._avg_latency
-        previous_avg_throughput = self._avg_throughput
+    async def _async_process_completion(self, tokens_used: int, success: bool, latency: float, batch_id: Any, remaining_tasks: Optional[int]):
+        """Processa resultado e ajusta concorrência baseado em eficiência."""
+        # Salva métricas anteriores para comparação
+        previous_metrics = PerformanceMetrics(
+            avg_latency=self._current_avg_latency,
+            avg_throughput=self._current_avg_throughput,
+            efficiency_score=self._current_efficiency_score,
+            success_rate=self._current_success_rate,
+            concurrency_level=self.dynamic_concurrency,
+            timestamp=time.time()
+        )
 
         async with self._lock:
+            # Atualiza dados de performance
             if success:
                 now = time.time()
                 self.token_usage_window.append((now, tokens_used))
                 self.tokens_in_window += tokens_used
                 self.request_completion_times.append(now)
-                self.recent_latencies.append(latency)
+                self._successful_requests_recent += 1
+            
+            self.recent_latencies.append(latency)
+            self.recent_success_flags.append(success)
             self._requests_counted_since_init += 1
+            
+            # Recalcula métricas
             self._update_performance_metrics()
+            
+            # Armazena snapshot para análise histórica
+            current_metrics = PerformanceMetrics(
+                avg_latency=self._current_avg_latency,
+                avg_throughput=self._current_avg_throughput,
+                efficiency_score=self._current_efficiency_score,
+                success_rate=self._current_success_rate,
+                concurrency_level=self.dynamic_concurrency,
+                timestamp=time.time()
+            )
+            self.performance_history.append(current_metrics)
 
-        self._stats_callback({"event_type": "token_usage_update", "current_tpm": self.tokens_in_window}, batch_id)
-        await self._gradient_concurrency_strategy(success, previous_avg_latency, previous_avg_throughput, remaining_tasks)
+        # Emite métricas para callback
+        self._stats_callback({
+            "event_type": "performance_update",
+            "concurrency": self.dynamic_concurrency,
+            "avg_latency": self._current_avg_latency,
+            "throughput": self._current_avg_throughput,
+            "efficiency_score": self._current_efficiency_score,
+            "success_rate": self._current_success_rate,
+            "tokens_in_window": self.tokens_in_window
+        }, batch_id)
 
-    async def _gradient_concurrency_strategy(self, success: bool, prev_latency: float, prev_throughput: float, remaining_tasks: Optional[int]):
-        """Ajusta a concorrência com base em uma análise mais robusta da performance."""
+        # Aplica estratégia de ajuste de concorrência
+        await self._efficiency_based_adjustment_strategy(previous_metrics, current_metrics, remaining_tasks)
+
+    async def _efficiency_based_adjustment_strategy(self, previous: PerformanceMetrics, current: PerformanceMetrics, remaining_tasks: Optional[int]):
+        """Ajusta concorrência baseado na análise de eficiência real."""
         now = time.time()
-        if self._is_adjusting_semaphore or (now - self._last_adjustment_time < ADJUSTMENT_COOLDOWN_SECONDS):
-            return
-
-        # 1. PERÍODO DE AQUECIMENTO: Ignora sinais de sobrecarga no início do lote.
-        if self._requests_counted_since_init < WARMUP_REQUESTS_COUNT:
-            return
-
-        latency_change = (self._avg_latency - prev_latency) / prev_latency if prev_latency > 0 else 0
         
-        # 2. CONDIÇÃO DE REDUÇÃO (SOBRECARGA): Reduz se a latência aumentou desproporcionalmente.
-        is_overloaded = not success or (latency_change > PERFORMANCE_CHANGE_THRESHOLD)
-        if is_overloaded:
-            new_concurrency = max(MIN_CONCURRENCY, int(self.dynamic_concurrency * MULTIPLICATIVE_DECREASE_FACTOR))
+        # Verificações de segurança
+        if (self._is_adjusting_semaphore or 
+            (now - self._last_adjustment_time < ADJUSTMENT_COOLDOWN_SECONDS) or
+            self._requests_counted_since_init < WARMUP_REQUESTS_COUNT):
+            return
+
+        # 1. CONDIÇÕES CRÍTICAS DE REDUÇÃO
+        critical_conditions = [
+            not current.success_rate >= 0.95,  # Taxa de sucesso baixa
+            current.avg_latency > MAX_LATENCY_ACCEPTABLE,  # Latência inaceitável
+            self._rate_limit_detected_recently,  # Rate limit detectado
+        ]
+
+        if any(critical_conditions):
+            reduction_factor = 0.6 if self._rate_limit_detected_recently else MULTIPLICATIVE_DECREASE_FACTOR
+            new_concurrency = max(MIN_CONCURRENCY, int(self.dynamic_concurrency * reduction_factor))
+            
             if new_concurrency < self.dynamic_concurrency:
-                self._maybe_log(f"Sinal de sobrecarga (latência: {latency_change:+.1%}). Reduzindo concorrência para {new_concurrency}.", level="warning")
+                reason = self._get_reduction_reason(critical_conditions)
+                self._maybe_log(f"REDUÇÃO CRÍTICA: {reason}. Concorrência: {self.dynamic_concurrency} -> {new_concurrency}", level="warning")
                 await self._set_concurrency(new_concurrency)
                 self._in_backoff_cooldown = True
+                self._stability_counter = 0
+                self._rate_limit_detected_recently = False
             return
 
-        # Durante o cooldown pós-redução, não aumenta a concorrência para estabilizar.
+        # 2. COOLDOWN PÓS-REDUÇÃO
         if self._in_backoff_cooldown:
             if (now - self._last_adjustment_time) > (ADJUSTMENT_COOLDOWN_SECONDS * 2):
                 self._in_backoff_cooldown = False
+                self._stability_counter = 0
+                self._maybe_log("Saindo do cooldown. Monitorando estabilidade...")
+            return
+
+        # 3. AFUNILAMENTO NO FINAL DO LOTE
+        if remaining_tasks is not None and remaining_tasks > 0:
+            optimal_concurrency = min(self.dynamic_concurrency, remaining_tasks + 10)
+            if optimal_concurrency < self.dynamic_concurrency:
+                self._maybe_log(f"Afunilamento final: {remaining_tasks} tarefas restantes. Concorrência: {self.dynamic_concurrency} -> {optimal_concurrency}")
+                await self._set_concurrency(optimal_concurrency)
+                return
+
+        # 4. ANÁLISE DE EFICIÊNCIA PARA AUMENTO
+        if len(self.performance_history) >= 2:
+            efficiency_trend = current.efficiency_score - previous.efficiency_score
+            latency_change = (current.avg_latency - previous.avg_latency) / previous.avg_latency if previous.avg_latency > 0 else 0
+            
+            # Verifica se sistema está estável
+            is_stable = (
+                abs(latency_change) < 0.1 and  # Latência estável
+                current.success_rate > 0.98 and  # Alto sucesso
+                current.avg_latency < MAX_LATENCY_ACCEPTABLE * 0.8  # Latência confortável
+            )
+            
+            if is_stable:
+                self._stability_counter += 1
             else:
-                return
+                self._stability_counter = 0
+            
+            # Só aumenta se houver estabilidade consistente
+            if (self._stability_counter >= STABILITY_REQUIRED_CYCLES and 
+                efficiency_trend > 0 and 
+                self.dynamic_concurrency < MAX_CONCURRENCY):
+                
+                # Escolhe estratégia de aumento baseada na performance
+                if efficiency_trend > EFFICIENCY_IMPROVEMENT_THRESHOLD:
+                    # Aumento multiplicativo se eficiência está melhorando significativamente
+                    new_concurrency = min(MAX_CONCURRENCY, int(self.dynamic_concurrency * MULTIPLICATIVE_INCREASE_FACTOR))
+                else:
+                    # Aumento conservador
+                    new_concurrency = min(MAX_CONCURRENCY, self.dynamic_concurrency + ADDITIVE_INCREASE_STEP)
+                
+                if new_concurrency > self.dynamic_concurrency:
+                    self._maybe_log(f"Aumento por eficiência: score={current.efficiency_score:.3f} (+{efficiency_trend:+.3f}). Concorrência: {self.dynamic_concurrency} -> {new_concurrency}")
+                    await self._set_concurrency(new_concurrency)
+                    self._stability_counter = 0  # Reset para nova validação
 
-        # 3. AFUNILAMENTO NO FIM DO LOTE: Limita a concorrência ao trabalho restante.
-        if remaining_tasks is not None:
-            # Adiciona um pequeno buffer para não limitar agressivamente demais
-            target_concurrency = max(MIN_CONCURRENCY, remaining_tasks + 5)
-            if self.dynamic_concurrency > target_concurrency:
-                self._maybe_log(f"Fim de lote detectado. Afunilando concorrência para {target_concurrency}.")
-                await self._set_concurrency(target_concurrency)
-                return
-
-        # 4. CONDIÇÃO DE AUMENTO (SISTEMA SAUDÁVEL): Aumenta se a latência estiver estável ou melhorando.
-        if latency_change <= 0.0:  # Aumenta agressivamente se a latência cai ou fica igual
-            new_concurrency = min(MAX_CONCURRENCY, int(self.dynamic_concurrency * MULTIPLICATIVE_INCREASE_FACTOR) + 1)
-        else:  # Aumenta de forma conservadora se a latência sobe, mas sem sobrecarga.
-            new_concurrency = min(MAX_CONCURRENCY, self.dynamic_concurrency + ADDITIVE_INCREASE_STEP)
-
-        if new_concurrency > self.dynamic_concurrency:
-            await self._set_concurrency(new_concurrency)
+    def _get_reduction_reason(self, conditions: list) -> str:
+        """Retorna a razão da redução baseada nas condições críticas."""
+        reasons = []
+        if conditions[0]: reasons.append("baixa taxa de sucesso")
+        if conditions[1]: reasons.append("latência excessiva")
+        if conditions[2]: reasons.append("rate limit detectado")
+        return ", ".join(reasons)
 
     async def _set_concurrency(self, new_capacity: int):
-        """Ajusta o tamanho do semáforo de forma segura."""
-        if self._is_adjusting_semaphore: return
+        """Ajusta capacidade do semáforo de forma thread-safe."""
+        if self._is_adjusting_semaphore or new_capacity == self.dynamic_concurrency:
+            return
+        
         self._is_adjusting_semaphore = True
         try:
             current_concurrency = self.dynamic_concurrency
-            if new_capacity == current_concurrency: return
-            
-            self._maybe_log(f"Ajustando nível de concorrência: {current_concurrency} -> {new_capacity}")
-
             diff = new_capacity - current_concurrency
+            
             if diff > 0:
-                for _ in range(diff): self._semaphore.release()
+                # Aumenta capacidade
+                for _ in range(diff):
+                    self._semaphore.release()
             elif diff < 0:
+                # Reduz capacidade
                 tasks = [asyncio.create_task(self._semaphore.acquire()) for _ in range(abs(diff))]
                 await asyncio.gather(*tasks)
-
+            
             self.dynamic_concurrency = new_capacity
             self._last_adjustment_time = time.time()
-            self._stats_callback({"event_type": "concurrency_update", "new_concurrency": new_capacity}, None)
+            
+            # Callback para estatísticas
+            self._stats_callback({
+                "event_type": "concurrency_adjustment",
+                "old_concurrency": current_concurrency,
+                "new_concurrency": new_capacity,
+                "adjustment_reason": "efficiency_optimization"
+            }, None)
+            
         finally:
             self._is_adjusting_semaphore = False
 
     def _maybe_log(self, message: str, level: str = "info"):
-        """Registra uma mensagem apenas se o cooldown de logging tiver passado."""
+        """Log com throttling para evitar spam."""
         now = time.time()
         if (now - self._last_log_time) > LOGGING_COOLDOWN_SECONDS:
-            if hasattr(logger, level):
-                getattr(logger, level)(message)
-            else:
-                logger.info(message)
+            log_func = getattr(logger, level, logger.info)
+            log_func(message)
             self._last_log_time = now
 
     def record_api_rate_limit(self, wait_time: float, batch_id: Any = None):
-        """Reage a um erro de rate limit explícito da API."""
-        asyncio.create_task(self._async_handle_rate_limit_error(wait_time, batch_id))
+        """Registra detecção de rate limit e ajusta agressivamente."""
+        self._rate_limit_detected_recently = True
+        asyncio.create_task(self._async_handle_rate_limit(wait_time, batch_id))
 
-    async def _async_handle_rate_limit_error(self, wait_time: float, batch_id: Any):
-        """Reduz a concorrência agressivamente em resposta a um erro 429 da API."""
-        logger.error(f"RATE LIMIT EXPLÍCITO DA API! Reduzindo concorrência e pausando por {wait_time:.1f}s.")
-        new_concurrency = max(MIN_CONCURRENCY, int(self.dynamic_concurrency * MULTIPLICATIVE_DECREASE_FACTOR))
+    async def _async_handle_rate_limit(self, wait_time: float, batch_id: Any):
+        """Trata rate limit com redução agressiva de concorrência."""
+        logger.error(f"🚨 RATE LIMIT DETECTADO! Reduzindo concorrência drasticamente e aguardando {wait_time:.1f}s")
+        
+        # Redução agressiva
+        new_concurrency = max(MIN_CONCURRENCY, int(self.dynamic_concurrency * 0.3))
         await self._set_concurrency(new_concurrency)
+        
+        # Ativa cooldown prolongado
         self._in_backoff_cooldown = True
-        self._stats_callback({"event_type": "api_rate_limit_detected", "wait_time": wait_time}, batch_id)
+        self._stability_counter = 0
+        
+        # Callback para estatísticas
+        self._stats_callback({
+            "event_type": "api_rate_limit_handled",
+            "wait_time": wait_time,
+            "concurrency_reduced_to": new_concurrency
+        }, batch_id)
+
+    def get_current_metrics(self) -> Dict[str, Any]:
+        """Retorna métricas atuais para debugging."""
+        return {
+            "concurrency": self.dynamic_concurrency,
+            "avg_latency": self._current_avg_latency,
+            "avg_throughput": self._current_avg_throughput,
+            "efficiency_score": self._current_efficiency_score,
+            "success_rate": self._current_success_rate,
+            "tokens_in_window": self.tokens_in_window,
+            "stability_counter": self._stability_counter,
+            "requests_processed": self._requests_counted_since_init,
+            "in_backoff": self._in_backoff_cooldown
+        }
