@@ -10,7 +10,7 @@ import asyncio
 import logging
 import os
 import shutil
-from typing import List, Dict, Any, Optional, Literal, Callable
+from typing import List, Dict, Any, Optional, Literal, Union
 
 from dataclasses import dataclass
 import chromadb
@@ -20,14 +20,14 @@ from chonkie import (
     SentenceChunker,
     RecursiveChunker,
     SemanticChunker,
-    BaseChunker
+    TokenChunker  # Alternativa mais estável ao SemanticChunker
 )
 
 logger = logging.getLogger(__name__)
 
 # Constantes de configuração padrão do módulo
 DEFAULT_TOP_K = 5
-CHUNKING_STRATEGIES = Literal["semantic", "recursive", "sentence"]
+CHUNKING_STRATEGIES = Literal["semantic", "recursive", "sentence", "token"]
 
 @dataclass
 class RetrievalResult:
@@ -42,8 +42,6 @@ class RAGManager:
     pré-configuradas e integração otimizada com ChromaDB.
     """
     
-    AVAILABLE_STRATEGIES = CHUNKING_STRATEGIES
-
     def __init__(self, ai_processor: 'AIProcessor', project_dir: str):
         """
         Inicializa o RAGManager.
@@ -60,36 +58,37 @@ class RAGManager:
 
         self.db_client = chromadb.PersistentClient(path=self.vector_store_path)
 
-        # Invólucro síncrono para a função de embedding, necessário para o SemanticChunker.
-        self._sync_embedder = self._create_sync_embedding_wrapper()
-
-        self.chunkers: Dict[CHUNKING_STRATEGIES, BaseChunker] = {
+        # Configuração correta dos chunkers
+        self.chunkers: Dict[CHUNKING_STRATEGIES, Union[SentenceChunker, RecursiveChunker, SemanticChunker, TokenChunker]] = {
             "semantic": SemanticChunker(
-                embedder=self._sync_embedder,
-                similarity_cutoff=0.6 
+                embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+                threshold=0.6,
+                chunk_size=512,
+                min_sentences=1
             ),
             "recursive": RecursiveChunker(
-                separators=["\n\n", "\n", ". ", " ", ""],
+                chunk_size=1000,
+                tokenizer="gpt2"
+            ),
+            "sentence": SentenceChunker(
+                chunk_size=1000,
+                tokenizer="gpt2"
+            ),
+            "token": TokenChunker(
                 chunk_size=1000,
                 chunk_overlap=100,
-            ),
-            "sentence": SentenceChunker()
+                tokenizer="gpt2"
+            )
         }
         
         logger.info(
             f"RAGManager inicializado. Estratégias disponíveis: {', '.join(self.chunkers.keys())}"
         )
 
-    def _create_sync_embedding_wrapper(self) -> Callable[[List[str]], List[List[float]]]:
-        """Cria um invólucro síncrono para a função de embedding assíncrona."""
-        def sync_embed_function(texts: List[str]) -> List[List[float]]:
-            return asyncio.run(self.ai_processor.process_embedding_batch(texts))
-        return sync_embed_function
-
     async def ingest_documents(
         self,
         collection_name: str,
-        strategy: CHUNKING_STRATEGIES = "semantic",
+        strategy: CHUNKING_STRATEGIES = "token",  # Mudança para estratégia mais estável
         relative_path: str = '',
         force_update: bool = False
     ) -> int:
@@ -112,60 +111,82 @@ class RAGManager:
             name=collection_name, metadata={"hnsw:space": "cosine"}
         )
         
-        chonker = self.chunkers.get(strategy)
-        if not chonker:
+        chunker = self.chunkers.get(strategy)
+        if not chunker:
             raise ValueError(f"Estratégia '{strategy}' inválida. Disponíveis: {list(self.chunkers.keys())}")
 
         files_to_process = [f for f in os.listdir(ingest_dir) if os.path.isfile(os.path.join(ingest_dir, f))]
+        processed_files = 0
         
         for file_name in files_to_process:
             if not force_update and await self._is_file_ingested(collection, file_name):
                 logger.info(f"Arquivo '{file_name}' já ingerido. Pulando.")
                 continue
 
-            with open(os.path.join(ingest_dir, file_name), 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
-            logger.info(f"Processando '{file_name}' com a estratégia '{strategy}'...")
+            try:
+                with open(os.path.join(ingest_dir, file_name), 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                
+                logger.info(f"Processando '{file_name}' com a estratégia '{strategy}'...")
 
-            # 1. Chunking (operação síncrona em thread separada)
-            chunks = await asyncio.to_thread(chonker, content)
-            if not chunks:
-                logger.warning(f"Nenhum chunk gerado para o arquivo '{file_name}'.")
+                # 1. Chunking (operação síncrona em thread separada) - CORREÇÃO CRÍTICA
+                try:
+                    chunk_objects = await asyncio.to_thread(chunker.chunk, content)
+                    chunks = [chunk.text for chunk in chunk_objects]  # Extrair texto dos objetos
+                except Exception as e:
+                    logger.error(f"Erro no chunking de '{file_name}': {e}")
+                    continue
+                    
+                if not chunks:
+                    logger.warning(f"Nenhum chunk gerado para o arquivo '{file_name}'.")
+                    continue
+
+                # 2. Embedding (operação assíncrona nativa)
+                embedding_results = await self.ai_processor.process_embedding_batch(chunks)
+
+                # 3. Preparação dos Dados
+                docs_to_add, embeddings_to_add, metadatas_to_add, ids_to_add = [], [], [], []
+                for i, result in enumerate(embedding_results['results']):
+                    if result.get('success'):
+                        docs_to_add.append(chunks[i])
+                        embeddings_to_add.append(result['content'])
+                        metadatas_to_add.append({'file': file_name, 'chunk_id': i})
+                        ids_to_add.append(f"{file_name}_{i}")
+
+                if not docs_to_add:
+                    logger.error(f"Falha ao gerar embeddings para todos os chunks de '{file_name}'.")
+                    continue
+
+                # 4. Adição ao ChromaDB (operação síncrona em thread separada)
+                try:
+                    await asyncio.to_thread(
+                        collection.add,
+                        embeddings=embeddings_to_add,
+                        documents=docs_to_add,
+                        metadatas=metadatas_to_add,
+                        ids=ids_to_add
+                    )
+                    processed_files += 1
+                    logger.info(f"Arquivo '{file_name}' processado com sucesso ({len(docs_to_add)} chunks).")
+                except Exception as e:
+                    logger.error(f"Erro ao adicionar chunks de '{file_name}' ao ChromaDB: {e}")
+                    continue
+
+            except Exception as e:
+                logger.error(f"Erro ao processar arquivo '{file_name}': {e}")
                 continue
 
-            # 2. Embedding (operação assíncrona nativa)
-            embedding_results = await self.ai_processor.process_embedding_batch(chunks)
-
-            # 3. Preparação dos Dados
-            docs_to_add, embeddings_to_add, metadatas_to_add, ids_to_add = [], [], [], []
-            for i, result in enumerate(embedding_results['results']):
-                if result.get('success'):
-                    docs_to_add.append(chunks[i])
-                    embeddings_to_add.append(result['content'])
-                    metadatas_to_add.append({'file': file_name, 'chunk_id': i})
-                    ids_to_add.append(f"{file_name}_{i}")
-
-            if not docs_to_add:
-                logger.error(f"Falha ao gerar embeddings para todos os chunks de '{file_name}'.")
-                continue
-
-            # 4. Adição ao ChromaDB (operação síncrona em thread separada)
-            await asyncio.to_thread(
-                collection.add,
-                embeddings=embeddings_to_add,
-                documents=docs_to_add,
-                metadatas=metadatas_to_add,
-                ids=ids_to_add
-            )
-
-        logger.info(f"Ingestão concluída para '{collection_name}': {len(files_to_process)} arquivos avaliados.")
-        return len(files_to_process)
+        logger.info(f"Ingestão concluída para '{collection_name}': {processed_files}/{len(files_to_process)} arquivos processados.")
+        return processed_files
 
     async def _is_file_ingested(self, collection: chromadb.Collection, file_name: str) -> bool:
         """Verifica de forma assíncrona se um arquivo já foi ingerido."""
-        result = await asyncio.to_thread(collection.get, where={"file": file_name}, limit=1)
-        return bool(result['ids'])
+        try:
+            result = await asyncio.to_thread(collection.get, where={"file": file_name}, limit=1)
+            return bool(result['ids'])
+        except Exception as e:
+            logger.error(f"Erro ao verificar se arquivo '{file_name}' já foi ingerido: {e}")
+            return False
 
     async def retrieve(
         self,
