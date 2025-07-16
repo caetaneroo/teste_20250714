@@ -15,14 +15,12 @@ from typing import List, Dict, Any, Optional, Literal, Callable
 from dataclasses import dataclass
 import chromadb
 
-# Importa as classes da biblioteca 'chonkie' da forma correta,
-# diretamente do pacote principal, conforme a documentação oficial.
+# Importa as classes da biblioteca 'chonkie' diretamente, conforme a documentação oficial.
 from chonkie import (
     SentenceChunker,
     RecursiveChunker,
     SemanticChunker,
-    BaseChunker,
-    ChromaHandshake
+    BaseChunker
 )
 
 logger = logging.getLogger(__name__)
@@ -41,7 +39,7 @@ class RetrievalResult:
 class RAGManager:
     """
     Módulo de RAG robusto e encapsulado. Oferece estratégias de chunking
-    pré-configuradas e integração otimizada com ChromaDB via ChromaHandshake.
+    pré-configuradas e integração otimizada com ChromaDB.
     """
     
     AVAILABLE_STRATEGIES = CHUNKING_STRATEGIES
@@ -62,19 +60,12 @@ class RAGManager:
 
         self.db_client = chromadb.PersistentClient(path=self.vector_store_path)
 
-        # Cria uma função de embedding compatível com as bibliotecas síncronas.
-        self._embedder = self._create_embedding_function()
-        
-        # Inicializa o ChromaHandshake com o parâmetro correto: 'embedder'.
-        self.handshake = ChromaHandshake(
-            embedder=self._embedder,
-            collection_name="default" # Será sobrescrito em cada chamada.
-        )
+        # Invólucro síncrono para a função de embedding, necessário para o SemanticChunker.
+        self._sync_embedder = self._create_sync_embedding_wrapper()
 
-        # Configura as estratégias de chunking, usando 'embedder' onde necessário.
         self.chunkers: Dict[CHUNKING_STRATEGIES, BaseChunker] = {
             "semantic": SemanticChunker(
-                embedder=self._embedder,
+                embedder=self._sync_embedder,
                 similarity_cutoff=0.6 
             ),
             "recursive": RecursiveChunker(
@@ -89,21 +80,11 @@ class RAGManager:
             f"RAGManager inicializado. Estratégias disponíveis: {', '.join(self.chunkers.keys())}"
         )
 
-    async def _async_embed_texts(self, texts: List[str]) -> List[List[float]]:
-        """A corrotina assíncrona principal que gera os embeddings."""
-        if not texts or not any(texts):
-            return []
-        response = await self.ai_processor.process_embedding_batch(texts)
-        # Retorna um vetor vazio para qualquer falha, mantendo a consistência do lote.
-        return [res['content'] if res.get('success') else [] for res in response['results']]
-
-    def _create_embedding_function(self) -> Callable[[List[str]], List[List[float]]]:
+    def _create_sync_embedding_wrapper(self) -> Callable[[List[str]], List[List[float]]]:
         """Cria um invólucro síncrono para a função de embedding assíncrona."""
-        def embedding_function(texts: List[str]) -> List[List[float]]:
-            # Executa a função assíncrona em um loop de eventos gerenciado.
-            return asyncio.run(self._async_embed_texts(texts))
-        
-        return embedding_function
+        def sync_embed_function(texts: List[str]) -> List[List[float]]:
+            return asyncio.run(self.ai_processor.process_embedding_batch(texts))
+        return sync_embed_function
 
     async def ingest_documents(
         self,
@@ -113,9 +94,9 @@ class RAGManager:
         force_update: bool = False
     ) -> int:
         """
-        Ingere documentos usando uma estratégia de chunking pré-configurada.
+        Ingere documentos usando uma orquestração manual e robusta.
         - collection_name: Nome da coleção no ChromaDB.
-        - strategy: Estratégia a ser usada ('semantic', 'recursive', 'sentence').
+        - strategy: Estratégia de chunking a ser usada.
         - relative_path: Subpasta dentro de 'documents/'.
         - force_update: Força re-ingestão de todos os arquivos.
         Retorna o número de arquivos processados.
@@ -133,9 +114,7 @@ class RAGManager:
         
         chonker = self.chunkers.get(strategy)
         if not chonker:
-            raise ValueError(f"Estratégia de chunking '{strategy}' inválida. Disponíveis: {list(self.chunkers.keys())}")
-
-        self.handshake.collection_name = collection_name
+            raise ValueError(f"Estratégia '{strategy}' inválida. Disponíveis: {list(self.chunkers.keys())}")
 
         files_to_process = [f for f in os.listdir(ingest_dir) if os.path.isfile(os.path.join(ingest_dir, f))]
         
@@ -148,14 +127,36 @@ class RAGManager:
                 content = f.read()
             
             logger.info(f"Processando '{file_name}' com a estratégia '{strategy}'...")
-            
-            # Executa a função síncrona 'run' do handshake em um thread separado.
+
+            # 1. Chunking (operação síncrona em thread separada)
+            chunks = await asyncio.to_thread(chonker, content)
+            if not chunks:
+                logger.warning(f"Nenhum chunk gerado para o arquivo '{file_name}'.")
+                continue
+
+            # 2. Embedding (operação assíncrona nativa)
+            embedding_results = await self.ai_processor.process_embedding_batch(chunks)
+
+            # 3. Preparação dos Dados
+            docs_to_add, embeddings_to_add, metadatas_to_add, ids_to_add = [], [], [], []
+            for i, result in enumerate(embedding_results['results']):
+                if result.get('success'):
+                    docs_to_add.append(chunks[i])
+                    embeddings_to_add.append(result['content'])
+                    metadatas_to_add.append({'file': file_name, 'chunk_id': i})
+                    ids_to_add.append(f"{file_name}_{i}")
+
+            if not docs_to_add:
+                logger.error(f"Falha ao gerar embeddings para todos os chunks de '{file_name}'.")
+                continue
+
+            # 4. Adição ao ChromaDB (operação síncrona em thread separada)
             await asyncio.to_thread(
-                self.handshake.run,
-                text=content,
-                chonker=chonker,
-                collection=collection,
-                metadata={'file': file_name}
+                collection.add,
+                embeddings=embeddings_to_add,
+                documents=docs_to_add,
+                metadatas=metadatas_to_add,
+                ids=ids_to_add
             )
 
         logger.info(f"Ingestão concluída para '{collection_name}': {len(files_to_process)} arquivos avaliados.")
@@ -178,8 +179,8 @@ class RAGManager:
         except ValueError:
             raise ValueError(f"Coleção '{collection_name}' não encontrada.")
         
-        query_embedding_list = await self._async_embed_texts([query])
-        query_embedding = query_embedding_list[0]
+        embedding_results = await self.ai_processor.process_embedding_batch([query])
+        query_embedding = embedding_results['results'][0].get('content')
         if not query_embedding:
             raise RuntimeError("Falha ao embeddar a query de busca.")
 
