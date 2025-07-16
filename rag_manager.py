@@ -17,14 +17,14 @@ from dataclasses import dataclass
 import chromadb
 
 # --- INÍCIO DA CORREÇÃO ---
-# Importa as classes diretamente de seus submódulos, conforme a documentação.
-from chonkie.chunkers import (
+# Importa as classes diretamente do pacote 'chonkie', conforme a documentação oficial.
+from chonkie import (
     SentenceChunker,
     RecursiveChunker,
     SemanticChunker,
-    BaseChunker
+    BaseChunker,
+    ChromaHandshake
 )
-from chonkie.handshakes import ChromaHandshake
 # --- FIM DA CORREÇÃO ---
 
 logger = logging.getLogger(__name__)
@@ -88,7 +88,7 @@ class RAGManager:
         )
 
     def _create_embedding_function(self) -> Callable[[List[str]], List[List[float]]]:
-        """Cria uma função de embedding compatível com Chonkie e ChromaDB."""
+        """Cria uma função de embedding síncrona, compatível com Chonkie e ChromaDB."""
         async def embed(texts: List[str]) -> List[List[float]]:
             if not texts:
                 return []
@@ -99,7 +99,6 @@ class RAGManager:
             ]
         
         def embedding_function(texts: List[str]) -> List[List[float]]:
-            # Executa a função assíncrona em um loop de eventos
             return asyncio.run(embed(texts))
         
         return embedding_function
@@ -148,6 +147,7 @@ class RAGManager:
             
             logger.info(f"Processando '{file_name}' com a estratégia '{strategy}'...")
             
+            # Roda a função síncrona 'run' do handshake em um thread separado para não bloquear o loop async.
             await asyncio.to_thread(
                 self.handshake.run,
                 text=content,
@@ -180,6 +180,7 @@ class RAGManager:
         if not query_embedding:
             raise RuntimeError("Falha ao embeddar a query de busca.")
 
+        # Executa a busca síncrona do ChromaDB em um thread separado.
         results = await asyncio.to_thread(
             collection.query,
             query_embeddings=[query_embedding],
