@@ -1,24 +1,32 @@
+# Garante compatibilidade com ChromaDB em diferentes ambientes Python
+try:
+    __import__('pysqlite3')
+    import sys
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+    print("pysqlite3 foi ativado para compatibilidade com ChromaDB.")
+except ImportError:
+    pass
+
 import asyncio
-import json
 import logging
 import os
 import shutil
-from typing import List, Dict, Any, Optional, Literal
+from typing import List, Dict, Any, Optional, Literal, Callable
 
 from dataclasses import dataclass
-# Bibliotecas de terceiros para robustez
 import chromadb
-from markdown_chunker import MarkdownChunkingStrategy
+from chonkie import (
+    Chonker,
+    SentenceChunker,
+    RecursiveChunker,
+    SemanticChunker,
+    ChromaHandshake,
+)
 
 logger = logging.getLogger(__name__)
 
-# Constantes padrão
-DEFAULT_SIMILARITY_THRESHOLD = 0.7
-DEFAULT_TOP_K = 5
-DEFAULT_CHUNK_SIZE = 1024 # Tamanho padrão para chunking
-
-# Tipos para chunking
-ChunkingStrategy = Literal["simple", "markdown"]
+# Define os nomes das estratégias disponíveis para o usuário
+CHUNKING_STRATEGIES = Literal["semantic", "recursive", "sentence"]
 
 @dataclass
 class RetrievalResult:
@@ -29,9 +37,12 @@ class RetrievalResult:
 
 class RAGManager:
     """
-    Módulo para Retrieval-Augmented Generation (RAG) robusto, integrado ao AIProcessor.
-    Utiliza ChromaDB para armazenamento vetorial e estratégias de chunking flexíveis.
+    Módulo de RAG robusto e encapsulado. Oferece estratégias de chunking
+    pré-configuradas e integração otimizada com ChromaDB via ChromaHandshake.
     """
+    
+    # Expõe as estratégias disponíveis como um atributo de classe para fácil descoberta
+    AVAILABLE_STRATEGIES = CHUNKING_STRATEGIES
 
     def __init__(self, ai_processor: 'AIProcessor', project_dir: str):
         """
@@ -47,34 +58,66 @@ class RAGManager:
         os.makedirs(self.documents_dir, exist_ok=True)
         os.makedirs(self.vector_store_path, exist_ok=True)
 
-        # 1. ARMAZENAMENTO VETORIAL ROBUSTO: ChromaDB
-        # Usa o cliente persistente para salvar os dados no disco.
         self.db_client = chromadb.PersistentClient(path=self.vector_store_path)
+
+        # --- Encapsulamento das Estratégias ---
+        self._embedding_func = self._create_embedding_function()
         
-        # Inicializa a estratégia de chunking de markdown
-        self.markdown_chunker = MarkdownChunkingStrategy(
-            min_chunk_len=256, 
-            soft_max_len=DEFAULT_CHUNK_SIZE, 
-            hard_max_len=DEFAULT_CHUNK_SIZE * 2
+        # O ChromaHandshake simplifica a comunicação entre chunking, embedding e o DB.
+        self.handshake = ChromaHandshake(
+            embedding_function=self._embedding_func,
+            collection_name="default" # Será sobrescrito em cada chamada de ingestão
         )
 
-        logger.info(f"RAGManager inicializado. Armazenamento vetorial em '{self.vector_store_path}'.")
+        # Dicionário de estratégias pré-configuradas e prontas para uso.
+        self.chunkers: Dict[CHUNKING_STRATEGIES, Chonker] = {
+            "semantic": SemanticChunker(
+                embedding_function=self._embedding_func,
+                # Usa um limiar mais baixo para agrupar semanticamente mais sentenças
+                similarity_cutoff=0.6 
+            ),
+            "recursive": RecursiveChunker(
+                separators=["\n\n", "\n", ". ", " ", ""],
+                chunk_size=1000,
+                chunk_overlap=100,
+            ),
+            "sentence": SentenceChunker()
+        }
+        
+        logger.info(
+            f"RAGManager inicializado. Estratégias disponíveis: {', '.join(self.chunkers.keys())}"
+        )
+
+    def _create_embedding_function(self) -> Callable[[List[str]], List[List[float]]]:
+        """Cria uma função de embedding compatível com Chonkie e ChromaDB."""
+        async def embed(texts: List[str]) -> List[List[float]]:
+            if not texts:
+                return []
+            response = await self.ai_processor.process_embedding_batch(texts)
+            # Retorna uma lista vazia para os embeddings que falharam, mantendo a ordem
+            return [
+                res['content'] if res.get('success') else []
+                for res in response['results']
+            ]
+        
+        def embedding_function(texts: List[str]) -> List[List[float]]:
+            return asyncio.run(embed(texts))
+        
+        return embedding_function
 
     async def ingest_documents(
         self,
         collection_name: str,
+        strategy: CHUNKING_STRATEGIES = "semantic",
         relative_path: str = '',
-        force_update: bool = False,
-        chunk_strategy: ChunkingStrategy = "simple",
-        chunk_size: int = DEFAULT_CHUNK_SIZE
+        force_update: bool = False
     ) -> int:
         """
-        Ingestão de documentos: lê arquivos, chunkifica, embedda e armazena no ChromaDB.
-        - collection_name: Nome da coleção no ChromaDB para agrupar os documentos.
-        - relative_path: Subpasta dentro de 'documents/' (opcional).
+        Ingere documentos usando uma estratégia de chunking pré-configurada.
+        - collection_name: Nome da coleção no ChromaDB.
+        - strategy: Estratégia de chunking a ser usada ('semantic', 'recursive', 'sentence').
+        - relative_path: Subpasta dentro de 'documents/'.
         - force_update: Força re-ingestão de todos os arquivos.
-        - chunk_strategy: 'simple' (baseado em frases) ou 'markdown' (estruturado).
-        - chunk_size: Tamanho alvo de cada chunk em caracteres (usado no modo 'simple').
         Retorna o número de arquivos processados.
         """
         ingest_dir = os.path.join(self.documents_dir, relative_path)
@@ -85,145 +128,113 @@ class RAGManager:
             self.clear_vector_store(collection_name)
 
         collection = self.db_client.get_or_create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"} # Configura para usar similaridade de cosseno
+            name=collection_name, metadata={"hnsw:space": "cosine"}
         )
+        
+        # Seleciona o chunker pré-configurado
+        chonker = self.chunkers.get(strategy)
+        if not chonker:
+            raise ValueError(f"Estratégia de chunking '{strategy}' inválida. Disponíveis: {list(self.chunkers.keys())}")
+
+        self.handshake.collection_name = collection_name
 
         files_to_process = [f for f in os.listdir(ingest_dir) if os.path.isfile(os.path.join(ingest_dir, f))]
         
         for file_name in files_to_process:
             if not force_update and self._is_file_ingested(collection, file_name):
-                logger.info(f"Arquivo '{file_name}' já ingerido na coleção '{collection_name}'. Pulando.")
+                logger.info(f"Arquivo '{file_name}' já ingerido. Pulando.")
                 continue
 
             with open(os.path.join(ingest_dir, file_name), 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
-
-            # 2. ESTRATÉGIAS DE CHUNKING FLEXÍVEIS
-            if chunk_strategy == "markdown":
-                chunks = self.markdown_chunker.chunk_markdown(content)
-            else: # 'simple'
-                chunks = self._chunk_text_simple(content, chunk_size)
-
-            if not chunks:
-                logger.warning(f"Nenhum chunk gerado para o arquivo '{file_name}'. Pulando.")
-                continue
-                
-            logger.info(f"Processando {len(chunks)} chunks de '{file_name}' para a coleção '{collection_name}'...")
-
-            emb_response = await self.ai_processor.process_embedding_batch(
-                chunks, batch_id=f"ingest_{collection_name}_{file_name}"
-            )
             
-            embeddings = [res['content'] for res in emb_response['results'] if res['success']]
-            successful_chunks = [chunks[i] for i, res in enumerate(emb_response['results']) if res['success']]
-
-            if not successful_chunks:
-                logger.error(f"Falha ao gerar embeddings para todos os chunks de '{file_name}'.")
-                continue
-
-            ids = [f"{file_name}_chunk_{i}" for i in range(len(successful_chunks))]
-            metadatas = [{'file': file_name, 'chunk_id': i} for i in range(len(successful_chunks))]
+            logger.info(f"Processando '{file_name}' com a estratégia '{strategy}'...")
             
-            collection.add(
-                documents=successful_chunks,
-                embeddings=embeddings,
-                metadatas=metadatas,
-                ids=ids
+            # O ChromaHandshake orquestra o chunking, embedding e adição ao DB.
+            self.handshake.run(
+                text=content,
+                chonker=chonker,
+                collection=collection,
+                metadata={'file': file_name} # Metadado base para todos os chunks deste arquivo
             )
 
-        logger.info(f"Ingestão concluída para a coleção '{collection_name}': {len(files_to_process)} arquivos avaliados.")
+        logger.info(f"Ingestão concluída para '{collection_name}': {len(files_to_process)} arquivos avaliados.")
         return len(files_to_process)
 
     def _is_file_ingested(self, collection: chromadb.Collection, file_name: str) -> bool:
-        """Verifica se algum documento de um arquivo já existe na coleção."""
         result = collection.get(where={"file": file_name}, limit=1)
         return bool(result['ids'])
-
-    def _chunk_text_simple(self, text: str, chunk_size: int) -> List[str]:
-        """Chunking simples: divide texto em pedaços, respeitando frases."""
-        chunks, current_chunk = [], ""
-        for sentence in text.split('. '):
-            if len(current_chunk) + len(sentence) + 2 > chunk_size and current_chunk:
-                chunks.append(current_chunk.strip())
-                current_chunk = ""
-            current_chunk += sentence + '. '
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-        return chunks
 
     async def retrieve(
         self,
         collection_name: str,
         query: str,
-        top_k: int = DEFAULT_TOP_K,
-        similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD
+        top_k: int = DEFAULT_TOP_K
     ) -> List[RetrievalResult]:
-        """
-        Recupera chunks semelhantes à query de uma coleção no ChromaDB.
-        """
+        """Recupera chunks semelhantes à query de uma coleção no ChromaDB."""
         try:
             collection = self.db_client.get_collection(name=collection_name)
         except ValueError:
-            raise ValueError(f"Coleção '{collection_name}' não encontrada. Execute ingest_documents primeiro.")
+            raise ValueError(f"Coleção '{collection_name}' não encontrada.")
         
-        query_emb_result = await self.ai_processor.process_embedding_batch([query], batch_id="retrieve_query")
-        if not query_emb_result['results'][0]['success']:
+        query_embedding = self._embedding_func([query])[0]
+        if not query_embedding:
             raise RuntimeError("Falha ao embeddar a query de busca.")
-        query_embedding = query_emb_result['results'][0]['content']
 
-        # 3. BUSCA DE SIMILARIDADE OTIMIZADA COM CHROMADB
-        # ChromaDB retorna 'distances'. Para cosseno, distância = 1 - similaridade.
-        # Portanto, filtramos onde a distância é MENOR que (1 - threshold).
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k,
-            where={"$and": [{"distance": {"$lte": 1 - similarity_threshold}}]} # Filtro customizado de metadados não é padrão, filtro de distância sim.
-        )
+        results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
         
         retrieval_results = []
-        # O resultado de query é uma lista, uma para cada query_embedding. Pegamos a primeira.
         if results['ids'][0]:
-            for i, doc_id in enumerate(results['ids'][0]):
+            for i in range(len(results['ids'][0])):
                 distance = results['distances'][0][i]
-                similarity = 1 - distance
-                if similarity >= similarity_threshold:
-                    retrieval_results.append(
-                        RetrievalResult(
-                            content=results['documents'][0][i],
-                            similarity=similarity,
-                            metadata=results['metadatas'][0][i]
-                        )
+                retrieval_results.append(
+                    RetrievalResult(
+                        content=results['documents'][0][i],
+                        similarity=1 - distance,
+                        metadata=results['metadatas'][0][i]
                     )
-        
-        # A ordenação já é feita pelo ChromaDB.
+                )
         return retrieval_results
 
-    def enrich_prompts(self, base_prompts: List[str], retrieved: List[RetrievalResult], context_template: str = "Contexto relevante: {context}\n") -> List[str]:
-        """Enriquece uma lista de prompts com contextos recuperados."""
+    def inspect_collection(self, collection_name: str, limit: int = 5) -> Optional[Dict[str, Any]]:
+        """Inspeciona o conteúdo de uma coleção no ChromaDB."""
+        try:
+            collection = self.db_client.get_collection(name=collection_name)
+            count = collection.count()
+            if count == 0:
+                print(f"Coleção '{collection_name}' existe mas está vazia.")
+                return {'name': collection_name, 'count': 0, 'sample': []}
+                
+            sample = collection.get(limit=limit, include=["metadatas", "documents"])
+            
+            print(f"--- Inspeção da Coleção: '{collection_name}' ---")
+            print(f"Total de itens: {count}")
+            for i, doc_id in enumerate(sample['ids']):
+                print(f"  - ID: {doc_id} | Metadata: {sample['metadatas'][i]}")
+                print(f"    Documento: \"{sample['documents'][i][:120].strip()}...\"")
+            print("-" * 43)
+            return {'name': collection_name, 'count': count, 'sample': sample}
+        except ValueError:
+            print(f"Coleção '{collection_name}' não encontrada.")
+            return None
+
+    def enrich_prompts(self, base_prompts: List[str], retrieved: List[RetrievalResult], context_template: str = "Use o seguinte contexto para responder à pergunta:\n\n---\n{context}\n---\n") -> List[str]:
         if not retrieved:
             return base_prompts
-            
-        contexts = [context_template.format(context=res.content) for res in retrieved]
-        combined_context = "\n".join(contexts)
-        
-        return [combined_context + prompt for prompt in base_prompts]
+        combined_context = "\n\n".join([res.content for res in retrieved])
+        return [context_template.format(context=combined_context) + prompt for prompt in base_prompts]
 
     def clear_vector_store(self, collection_name: Optional[str] = None):
-        """
-        Limpa uma coleção específica ou todo o armazenamento vetorial.
-        - collection_name: Se fornecido, apaga apenas essa coleção. Senão, apaga TUDO.
-        """
+        """Limpa uma coleção específica ou todo o armazenamento vetorial."""
         if collection_name:
             try:
                 self.db_client.delete_collection(name=collection_name)
-                logger.info(f"Coleção '{collection_name}' removida do ChromaDB.")
+                logger.info(f"Coleção '{collection_name}' removida.")
             except ValueError:
-                logger.warning(f"Tentativa de apagar coleção '{collection_name}' que não existe.")
+                pass
         else:
-            # Apaga todo o diretório do ChromaDB para uma limpeza completa.
-            shutil.rmtree(self.vector_store_path)
+            if os.path.exists(self.vector_store_path):
+                shutil.rmtree(self.vector_store_path)
             os.makedirs(self.vector_store_path, exist_ok=True)
-            # Recria o cliente para operar sobre o diretório limpo.
             self.db_client = chromadb.PersistentClient(path=self.vector_store_path)
             logger.info("Todo o armazenamento vetorial foi limpo e recriado.")
