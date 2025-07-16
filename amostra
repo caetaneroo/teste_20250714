@@ -1,0 +1,101 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import norm
+
+def amostra_estratificada(df, negocio_col='negócio', confianca=0.95, margem_erro=0.05):
+    """
+    Calcula uma amostra estratificada de um DataFrame baseada em nível de confiança e margem de erro.
+    
+    Parâmetros:
+    - df: DataFrame pandas
+    - negocio_col: nome da coluna para estratificação (default: 'negócio')
+    - confianca: nível de confiança (default: 0.95 = 95%)
+    - margem_erro: margem de erro (default: 0.05 = 5%)
+    
+    Retorna:
+    - DataFrame com a amostra estratificada
+    """
+    
+    # Calcula o valor Z para o nível de confiança
+    z_score = norm.ppf(1 - (1 - confianca) / 2)
+    
+    # Calcula o tamanho da amostra total necessária
+    # Usando fórmula: n = (Z² × p × (1-p)) / E²
+    # Assumindo p = 0.5 (caso mais conservador)
+    p = 0.5
+    n_total = (z_score**2 * p * (1-p)) / (margem_erro**2)
+    n_total = int(np.ceil(n_total))
+    
+    # Calcula os tamanhos dos estratos
+    estratos = df[negocio_col].value_counts()
+    proporcoes = estratos / len(df)
+    
+    # Calcula o tamanho da amostra para cada estrato
+    tamanhos_amostra = {}
+    for negocio, proporcao in proporcoes.items():
+        tamanho_estrato = int(np.ceil(n_total * proporcao))
+        # Garante que não exceda o tamanho do estrato
+        tamanho_estrato = min(tamanho_estrato, estratos[negocio])
+        tamanhos_amostra[negocio] = tamanho_estrato
+    
+    # Realiza a amostragem estratificada
+    amostras = []
+    for negocio, tamanho in tamanhos_amostra.items():
+        estrato = df[df[negocio_col] == negocio]
+        if len(estrato) >= tamanho:
+            amostra_estrato = estrato.sample(n=tamanho, random_state=42)
+            amostras.append(amostra_estrato)
+    
+    # Concatena todas as amostras
+    amostra_final = pd.concat(amostras, ignore_index=True)
+    
+    # Informações sobre a amostra
+    print(f"Tamanho da população: {len(df)}")
+    print(f"Tamanho da amostra: {len(amostra_final)}")
+    print(f"Nível de confiança: {confianca*100}%")
+    print(f"Margem de erro: {margem_erro*100}%")
+    print("\nDistribuição por negócio:")
+    for negocio, tamanho in tamanhos_amostra.items():
+        print(f"  {negocio}: {tamanho} registros")
+    
+    return amostra_final
+
+# Exemplo de uso
+def exemplo_uso():
+    # Criando um DataFrame de exemplo
+    np.random.seed(42)
+    data = {
+        'id': range(1, 10001),
+        'negócio': np.random.choice(['A', 'B', 'C', 'D'], 10000, p=[0.4, 0.3, 0.2, 0.1]),
+        'vendas': np.random.normal(1000, 200, 10000),
+        'regiao': np.random.choice(['Norte', 'Sul', 'Leste', 'Oeste'], 10000)
+    }
+    df = pd.DataFrame(data)
+    
+    # Usando a função
+    amostra = amostra_estratificada(df, 
+                                   negocio_col='negócio',
+                                   confianca=0.95,
+                                   margem_erro=0.05)
+    
+    return amostra
+
+# Versão mais simples (se quiser algo ainda mais direto)
+def amostra_estratificada_simples(df, negocio_col='negócio', tamanho_amostra=400):
+    """
+    Versão simplificada que aceita diretamente o tamanho da amostra.
+    """
+    estratos = df[negocio_col].value_counts()
+    proporcoes = estratos / len(df)
+    
+    amostras = []
+    for negocio, proporcao in proporcoes.items():
+        tamanho_estrato = int(np.ceil(tamanho_amostra * proporcao))
+        tamanho_estrato = min(tamanho_estrato, estratos[negocio])
+        
+        estrato = df[df[negocio_col] == negocio]
+        if len(estrato) >= tamanho_estrato:
+            amostra_estrato = estrato.sample(n=tamanho_estrato, random_state=42)
+            amostras.append(amostra_estrato)
+    
+    return pd.concat(amostras, ignore_index=True)
