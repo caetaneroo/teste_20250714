@@ -15,13 +15,17 @@ from typing import List, Dict, Any, Optional, Literal, Callable
 
 from dataclasses import dataclass
 import chromadb
-from chonkie import (
-    Chonker,
+
+# --- INÍCIO DA CORREÇÃO ---
+# Importa as classes diretamente de seus submódulos, conforme a documentação.
+from chonkie.chunkers import (
     SentenceChunker,
     RecursiveChunker,
     SemanticChunker,
-    ChromaHandshake,
+    BaseChunker
 )
+from chonkie.handshakes import ChromaHandshake
+# --- FIM DA CORREÇÃO ---
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +45,6 @@ class RAGManager:
     pré-configuradas e integração otimizada com ChromaDB via ChromaHandshake.
     """
     
-    # Expõe as estratégias disponíveis como um atributo de classe para fácil descoberta
     AVAILABLE_STRATEGIES = CHUNKING_STRATEGIES
 
     def __init__(self, ai_processor: 'AIProcessor', project_dir: str):
@@ -60,20 +63,16 @@ class RAGManager:
 
         self.db_client = chromadb.PersistentClient(path=self.vector_store_path)
 
-        # --- Encapsulamento das Estratégias ---
         self._embedding_func = self._create_embedding_function()
         
-        # O ChromaHandshake simplifica a comunicação entre chunking, embedding e o DB.
         self.handshake = ChromaHandshake(
             embedding_function=self._embedding_func,
-            collection_name="default" # Será sobrescrito em cada chamada de ingestão
+            collection_name="default"
         )
 
-        # Dicionário de estratégias pré-configuradas e prontas para uso.
-        self.chunkers: Dict[CHUNKING_STRATEGIES, Chonker] = {
+        self.chunkers: Dict[CHUNKING_STRATEGIES, BaseChunker] = {
             "semantic": SemanticChunker(
                 embedding_function=self._embedding_func,
-                # Usa um limiar mais baixo para agrupar semanticamente mais sentenças
                 similarity_cutoff=0.6 
             ),
             "recursive": RecursiveChunker(
@@ -94,13 +93,13 @@ class RAGManager:
             if not texts:
                 return []
             response = await self.ai_processor.process_embedding_batch(texts)
-            # Retorna uma lista vazia para os embeddings que falharam, mantendo a ordem
             return [
                 res['content'] if res.get('success') else []
                 for res in response['results']
             ]
         
         def embedding_function(texts: List[str]) -> List[List[float]]:
+            # Executa a função assíncrona em um loop de eventos
             return asyncio.run(embed(texts))
         
         return embedding_function
@@ -131,7 +130,6 @@ class RAGManager:
             name=collection_name, metadata={"hnsw:space": "cosine"}
         )
         
-        # Seleciona o chunker pré-configurado
         chonker = self.chunkers.get(strategy)
         if not chonker:
             raise ValueError(f"Estratégia de chunking '{strategy}' inválida. Disponíveis: {list(self.chunkers.keys())}")
@@ -150,12 +148,12 @@ class RAGManager:
             
             logger.info(f"Processando '{file_name}' com a estratégia '{strategy}'...")
             
-            # O ChromaHandshake orquestra o chunking, embedding e adição ao DB.
-            self.handshake.run(
+            await asyncio.to_thread(
+                self.handshake.run,
                 text=content,
                 chonker=chonker,
                 collection=collection,
-                metadata={'file': file_name} # Metadado base para todos os chunks deste arquivo
+                metadata={'file': file_name}
             )
 
         logger.info(f"Ingestão concluída para '{collection_name}': {len(files_to_process)} arquivos avaliados.")
@@ -177,11 +175,16 @@ class RAGManager:
         except ValueError:
             raise ValueError(f"Coleção '{collection_name}' não encontrada.")
         
-        query_embedding = self._embedding_func([query])[0]
+        query_embedding_list = await asyncio.to_thread(self._embedding_func, [query])
+        query_embedding = query_embedding_list[0]
         if not query_embedding:
             raise RuntimeError("Falha ao embeddar a query de busca.")
 
-        results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
+        results = await asyncio.to_thread(
+            collection.query,
+            query_embeddings=[query_embedding],
+            n_results=top_k
+        )
         
         retrieval_results = []
         if results['ids'][0]:
