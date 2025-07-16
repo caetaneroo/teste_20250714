@@ -1,9 +1,8 @@
-# Garante compatibilidade com ChromaDB em diferentes ambientes Python
+# Garante compatibilidade com ChromaDB, de forma silenciosa.
 try:
     __import__('pysqlite3')
     import sys
     sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
-    print("pysqlite3 foi ativado para compatibilidade com ChromaDB.")
 except ImportError:
     pass
 
@@ -16,8 +15,7 @@ from typing import List, Dict, Any, Optional, Literal, Callable
 from dataclasses import dataclass
 import chromadb
 
-# --- INÍCIO DA CORREÇÃO ---
-# Importa as classes diretamente do pacote 'chonkie', conforme a documentação oficial.
+# Importa as classes da biblioteca 'chonkie' da forma correta.
 from chonkie import (
     SentenceChunker,
     RecursiveChunker,
@@ -25,11 +23,11 @@ from chonkie import (
     BaseChunker,
     ChromaHandshake
 )
-# --- FIM DA CORREÇÃO ---
 
 logger = logging.getLogger(__name__)
 
-# Define os nomes das estratégias disponíveis para o usuário
+# Constantes de configuração padrão
+DEFAULT_TOP_K = 5
 CHUNKING_STRATEGIES = Literal["semantic", "recursive", "sentence"]
 
 @dataclass
@@ -67,7 +65,7 @@ class RAGManager:
         
         self.handshake = ChromaHandshake(
             embedding_function=self._embedding_func,
-            collection_name="default"
+            collection_name="default" # Será sobrescrito em cada chamada.
         )
 
         self.chunkers: Dict[CHUNKING_STRATEGIES, BaseChunker] = {
@@ -90,13 +88,10 @@ class RAGManager:
     def _create_embedding_function(self) -> Callable[[List[str]], List[List[float]]]:
         """Cria uma função de embedding síncrona, compatível com Chonkie e ChromaDB."""
         async def embed(texts: List[str]) -> List[List[float]]:
-            if not texts:
+            if not texts or not any(texts):
                 return []
             response = await self.ai_processor.process_embedding_batch(texts)
-            return [
-                res['content'] if res.get('success') else []
-                for res in response['results']
-            ]
+            return [res['content'] if res.get('success') else [] for res in response['results']]
         
         def embedding_function(texts: List[str]) -> List[List[float]]:
             return asyncio.run(embed(texts))
@@ -113,7 +108,7 @@ class RAGManager:
         """
         Ingere documentos usando uma estratégia de chunking pré-configurada.
         - collection_name: Nome da coleção no ChromaDB.
-        - strategy: Estratégia de chunking a ser usada ('semantic', 'recursive', 'sentence').
+        - strategy: Estratégia a ser usada ('semantic', 'recursive', 'sentence').
         - relative_path: Subpasta dentro de 'documents/'.
         - force_update: Força re-ingestão de todos os arquivos.
         Retorna o número de arquivos processados.
@@ -147,7 +142,6 @@ class RAGManager:
             
             logger.info(f"Processando '{file_name}' com a estratégia '{strategy}'...")
             
-            # Roda a função síncrona 'run' do handshake em um thread separado para não bloquear o loop async.
             await asyncio.to_thread(
                 self.handshake.run,
                 text=content,
@@ -180,7 +174,6 @@ class RAGManager:
         if not query_embedding:
             raise RuntimeError("Falha ao embeddar a query de busca.")
 
-        # Executa a busca síncrona do ChromaDB em um thread separado.
         results = await asyncio.to_thread(
             collection.query,
             query_embeddings=[query_embedding],
@@ -188,7 +181,7 @@ class RAGManager:
         )
         
         retrieval_results = []
-        if results['ids'][0]:
+        if results['ids'] and results['ids'][0]:
             for i in range(len(results['ids'][0])):
                 distance = results['distances'][0][i]
                 retrieval_results.append(
@@ -235,7 +228,7 @@ class RAGManager:
                 self.db_client.delete_collection(name=collection_name)
                 logger.info(f"Coleção '{collection_name}' removida.")
             except ValueError:
-                pass
+                pass # Coleção não existia, o que está OK.
         else:
             if os.path.exists(self.vector_store_path):
                 shutil.rmtree(self.vector_store_path)
