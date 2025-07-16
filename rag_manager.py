@@ -20,7 +20,7 @@ from chonkie import (
     SentenceChunker,
     RecursiveChunker,
     SemanticChunker,
-    TokenChunker  # Alternativa mais estável ao SemanticChunker
+    TokenChunker
 )
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ class RAGManager:
 
         self.db_client = chromadb.PersistentClient(path=self.vector_store_path)
 
-        # Configuração correta dos chunkers
+        # Configuração correta dos chunkers baseada na documentação oficial
         self.chunkers: Dict[CHUNKING_STRATEGIES, Union[SentenceChunker, RecursiveChunker, SemanticChunker, TokenChunker]] = {
             "semantic": SemanticChunker(
                 embedding_model="sentence-transformers/all-MiniLM-L6-v2",
@@ -66,13 +66,15 @@ class RAGManager:
                 chunk_size=512,
                 min_sentences=1
             ),
-            "recursive": RecursiveChunker(
+            "recursive": RecursiveChunker.from_recipe(
+                "markdown",
+                lang="en",
                 chunk_size=1000,
-                tokenizer="gpt2"
+                chunk_overlap=100
             ),
             "sentence": SentenceChunker(
-                chunk_size=1000,
-                tokenizer="gpt2"
+                tokenizer_or_token_counter="gpt2",
+                chunk_size=1000
             ),
             "token": TokenChunker(
                 chunk_size=1000,
@@ -88,7 +90,7 @@ class RAGManager:
     async def ingest_documents(
         self,
         collection_name: str,
-        strategy: CHUNKING_STRATEGIES = "token",  # Mudança para estratégia mais estável
+        strategy: CHUNKING_STRATEGIES = "token",
         relative_path: str = '',
         force_update: bool = False
     ) -> int:
@@ -129,7 +131,7 @@ class RAGManager:
                 
                 logger.info(f"Processando '{file_name}' com a estratégia '{strategy}'...")
 
-                # 1. Chunking (operação síncrona em thread separada) - CORREÇÃO CRÍTICA
+                # 1. Chunking (operação síncrona em thread separada)
                 try:
                     chunk_objects = await asyncio.to_thread(chunker.chunk, content)
                     chunks = [chunk.text for chunk in chunk_objects]  # Extrair texto dos objetos
@@ -266,3 +268,22 @@ class RAGManager:
             os.makedirs(self.vector_store_path, exist_ok=True)
             self.db_client = chromadb.PersistentClient(path=self.vector_store_path)
             logger.info("Todo o armazenamento vetorial foi limpo e recriado.")
+
+    def get_available_recipes(self) -> List[str]:
+        """Retorna as recipes disponíveis para RecursiveChunker."""
+        # Baseado na documentação oficial
+        return ["markdown", "html", "code", "text"]
+
+    def update_recursive_chunker_recipe(self, recipe: str, **kwargs):
+        """Atualiza o RecursiveChunker com uma nova recipe."""
+        try:
+            self.chunkers["recursive"] = RecursiveChunker.from_recipe(
+                recipe,
+                lang=kwargs.get("lang", "en"),
+                chunk_size=kwargs.get("chunk_size", 1000),
+                chunk_overlap=kwargs.get("chunk_overlap", 100)
+            )
+            logger.info(f"RecursiveChunker atualizado com recipe '{recipe}'.")
+        except Exception as e:
+            logger.error(f"Erro ao atualizar RecursiveChunker com recipe '{recipe}': {e}")
+            raise
