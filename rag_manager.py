@@ -1,4 +1,4 @@
-# Garante compatibilidade com ChromaDB, de forma silenciosa.
+# Garante compatibilidade com ChromaDB, de forma silenciosa e transparente.
 try:
     __import__('pysqlite3')
     import sys
@@ -15,7 +15,8 @@ from typing import List, Dict, Any, Optional, Literal, Callable
 from dataclasses import dataclass
 import chromadb
 
-# Importa as classes da biblioteca 'chonkie' da forma correta.
+# Importa as classes da biblioteca 'chonkie' da forma correta,
+# diretamente do pacote principal, conforme a documentação oficial.
 from chonkie import (
     SentenceChunker,
     RecursiveChunker,
@@ -26,13 +27,13 @@ from chonkie import (
 
 logger = logging.getLogger(__name__)
 
-# Constantes de configuração padrão
+# Constantes de configuração padrão do módulo
 DEFAULT_TOP_K = 5
 CHUNKING_STRATEGIES = Literal["semantic", "recursive", "sentence"]
 
 @dataclass
 class RetrievalResult:
-    """Estrutura para resultados de recuperação."""
+    """Estrutura padronizada para resultados de recuperação."""
     content: str
     similarity: float
     metadata: Dict[str, Any]
@@ -48,8 +49,8 @@ class RAGManager:
     def __init__(self, ai_processor: 'AIProcessor', project_dir: str):
         """
         Inicializa o RAGManager.
-        - ai_processor: Instância do AIProcessor para embeddings.
-        - project_dir: Caminho para a pasta do projeto.
+        - ai_processor: Instância do AIProcessor, usada para gerar embeddings.
+        - project_dir: Caminho para a pasta do projeto onde os dados serão armazenados.
         """
         self.ai_processor = ai_processor
         self.project_dir = os.path.abspath(project_dir)
@@ -61,16 +62,19 @@ class RAGManager:
 
         self.db_client = chromadb.PersistentClient(path=self.vector_store_path)
 
-        self._embedding_func = self._create_embedding_function()
+        # Cria uma função de embedding compatível com as bibliotecas síncronas.
+        self._embedder = self._create_embedding_function()
         
+        # Inicializa o ChromaHandshake com o parâmetro correto: 'embedder'.
         self.handshake = ChromaHandshake(
-            embedding_function=self._embedding_func,
+            embedder=self._embedder,
             collection_name="default" # Será sobrescrito em cada chamada.
         )
 
+        # Configura as estratégias de chunking, usando 'embedder' onde necessário.
         self.chunkers: Dict[CHUNKING_STRATEGIES, BaseChunker] = {
             "semantic": SemanticChunker(
-                embedding_function=self._embedding_func,
+                embedder=self._embedder,
                 similarity_cutoff=0.6 
             ),
             "recursive": RecursiveChunker(
@@ -85,16 +89,19 @@ class RAGManager:
             f"RAGManager inicializado. Estratégias disponíveis: {', '.join(self.chunkers.keys())}"
         )
 
+    async def _async_embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """A corrotina assíncrona principal que gera os embeddings."""
+        if not texts or not any(texts):
+            return []
+        response = await self.ai_processor.process_embedding_batch(texts)
+        # Retorna um vetor vazio para qualquer falha, mantendo a consistência do lote.
+        return [res['content'] if res.get('success') else [] for res in response['results']]
+
     def _create_embedding_function(self) -> Callable[[List[str]], List[List[float]]]:
-        """Cria uma função de embedding síncrona, compatível com Chonkie e ChromaDB."""
-        async def embed(texts: List[str]) -> List[List[float]]:
-            if not texts or not any(texts):
-                return []
-            response = await self.ai_processor.process_embedding_batch(texts)
-            return [res['content'] if res.get('success') else [] for res in response['results']]
-        
+        """Cria um invólucro síncrono para a função de embedding assíncrona."""
         def embedding_function(texts: List[str]) -> List[List[float]]:
-            return asyncio.run(embed(texts))
+            # Executa a função assíncrona em um loop de eventos gerenciado.
+            return asyncio.run(self._async_embed_texts(texts))
         
         return embedding_function
 
@@ -133,7 +140,7 @@ class RAGManager:
         files_to_process = [f for f in os.listdir(ingest_dir) if os.path.isfile(os.path.join(ingest_dir, f))]
         
         for file_name in files_to_process:
-            if not force_update and self._is_file_ingested(collection, file_name):
+            if not force_update and await self._is_file_ingested(collection, file_name):
                 logger.info(f"Arquivo '{file_name}' já ingerido. Pulando.")
                 continue
 
@@ -142,6 +149,7 @@ class RAGManager:
             
             logger.info(f"Processando '{file_name}' com a estratégia '{strategy}'...")
             
+            # Executa a função síncrona 'run' do handshake em um thread separado.
             await asyncio.to_thread(
                 self.handshake.run,
                 text=content,
@@ -153,8 +161,9 @@ class RAGManager:
         logger.info(f"Ingestão concluída para '{collection_name}': {len(files_to_process)} arquivos avaliados.")
         return len(files_to_process)
 
-    def _is_file_ingested(self, collection: chromadb.Collection, file_name: str) -> bool:
-        result = collection.get(where={"file": file_name}, limit=1)
+    async def _is_file_ingested(self, collection: chromadb.Collection, file_name: str) -> bool:
+        """Verifica de forma assíncrona se um arquivo já foi ingerido."""
+        result = await asyncio.to_thread(collection.get, where={"file": file_name}, limit=1)
         return bool(result['ids'])
 
     async def retrieve(
@@ -165,11 +174,11 @@ class RAGManager:
     ) -> List[RetrievalResult]:
         """Recupera chunks semelhantes à query de uma coleção no ChromaDB."""
         try:
-            collection = self.db_client.get_collection(name=collection_name)
+            collection = await asyncio.to_thread(self.db_client.get_collection, name=collection_name)
         except ValueError:
             raise ValueError(f"Coleção '{collection_name}' não encontrada.")
         
-        query_embedding_list = await asyncio.to_thread(self._embedding_func, [query])
+        query_embedding_list = await self._async_embed_texts([query])
         query_embedding = query_embedding_list[0]
         if not query_embedding:
             raise RuntimeError("Falha ao embeddar a query de busca.")
