@@ -1,0 +1,118 @@
+{
+  "type": "object",
+  "properties": {
+    "resumo_analise": {
+      "type": "object",
+      "properties": {
+        "total_mencoes": {
+          "type": "integer",
+          "description": "Número total de menções encontradas"
+        },
+        "papeis_identificados": {
+          "type": "object",
+          "properties": {
+            "cliente_identificado_como": {
+              "type": "string",
+              "enum": ["customer", "agent"],
+              "description": "Como o cliente foi identificado na transcrição"
+            },
+            "atendente_identificado_como": {
+              "type": "string",
+              "enum": ["customer", "agent"],
+              "description": "Como o atendente foi identificado na transcrição"
+            },
+            "papeis_invertidos": {
+              "type": "boolean",
+              "description": "Se os papéis estavam invertidos na transcrição"
+            }
+          },
+          "required": ["cliente_identificado_como", "atendente_identificado_como", "papeis_invertidos"]
+        }
+      },
+      "required": ["total_mencoes", "papeis_identificados"]
+    },
+    "mencoes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id_mencao": {
+            "type": "integer",
+            "description": "ID sequencial da menção"
+          },
+          "termo_encontrado": {
+            "type": "string",
+            "description": "Termo específico encontrado (gerente, executivo, representante comercial)"
+          },
+          "frase_original": {
+            "type": "string",
+            "description": "Frase original da transcrição contendo a menção"
+          },
+          "frase_reorganizada": {
+            "type": "string",
+            "description": "Frase reorganizada para maior coerência (se necessário)"
+          },
+          "contexto_anterior": {
+            "type": "string",
+            "description": "Contexto das frases anteriores relevantes"
+          },
+          "contexto_posterior": {
+            "type": "string",
+            "description": "Contexto das frases posteriores relevantes"
+          },
+          "quem_falou": {
+            "type": "string",
+            "enum": ["cliente", "atendente"],
+            "description": "Quem fez a menção ao gerente"
+          },
+          "classificacao": {
+            "type": "string",
+            "enum": [
+              "transcrição incorreta",
+              "fora de contexto",
+              "direcionando ao gerente",
+              "direcionado à central",
+              "reclamação ao gerente",
+              "elogio ao gerente",
+              "menção neutra ao gerente"
+            ],
+            "description": "Classificação da menção"
+          },
+          "justificativa": {
+            "type": "string",
+            "description": "Justificativa detalhada para a classificação"
+          },
+          "motivo_reclamacao": {
+            "type": "string",
+            "enum": [
+              "falta de retorno",
+              "demora no retorno",
+              "falta de alçada",
+              "orientação inadequada, insuficiente ou confusa",
+              "problemas de dados de contato",
+              "promessas não cumpridas",
+              null
+            ],
+            "description": "Motivo específico da reclamação (apenas para classificação 'reclamação ao gerente')"
+          },
+          "detalhes_reclamacao": {
+            "type": "string",
+            "description": "Detalhes específicos da reclamação (apenas para classificação 'reclamação ao gerente')"
+          }
+        },
+        "required": [
+          "id_mencao",
+          "termo_encontrado",
+          "frase_original",
+          "frase_reorganizada",
+          "contexto_anterior",
+          "contexto_posterior",
+          "quem_falou",
+          "classificacao",
+          "justificativa"
+        ]
+      }
+    }
+  },
+  "required": ["resumo_analise", "mencoes"]
+}
