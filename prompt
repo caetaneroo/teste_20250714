@@ -62,4 +62,4 @@ Antes de responder, considere:
 Analise a transcrição fornecida e retorne sua análise em formato JSON.
 
 TRANSCRIÇÃO PARA ANÁLISE:
-{transcricao}
+{text}
