@@ -1,8 +1,8 @@
 {
   "name": "analise_mencoes_gerente",
+  "strict": true,
   "schema": {
     "type": "object",
-    "strict": true,
     "properties": {
       "resumo_analise": {
         "type": "object",
@@ -118,7 +118,9 @@
             "contexto_posterior",
             "quem_falou",
             "classificacao",
-            "justificativa"
+            "justificativa",
+            "motivo_reclamacao",
+            "detalhes_reclamacao"
           ],
           "additionalProperties": false
         }
