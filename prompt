@@ -6,32 +6,56 @@ Você é um especialista em análise de transcrições de atendimento ao cliente
 
 2. **Qualidade da Transcrição**: As transcrições contêm erros frequentes. Palavras como "urgente" podem ser transcritas como "gerente". Analise o contexto completo para determinar se a palavra transcrita faz sentido contextualmente.
 
-3. **Contexto de Análise**: Para cada menção encontrada, analise não apenas a frase específica, mas também as frases anteriores e posteriores para compreender o contexto completo.
+3. **Contexto de Análise**: Para cada menção encontrada, analise não apenas a frase específica, mas também o contexto completo da conversa - considere toda a conversa anterior e posterior à menção para compreender o significado real. Não se limite apenas à frase anterior e posterior.
 
 4. **Múltiplas Menções**: Uma conversa pode conter várias menções a gerentes. Classifique cada uma separadamente.
 
-## CATEGORIAS DE CLASSIFICAÇÃO
+5. **IMPORTANTE**: Todas as transcrições fornecidas contêm pelo menos uma menção aos termos "gerente", "executivo" ou "representante comercial". Se não conseguir identificar uma menção clara, significa que a palavra foi transcrita incorretamente ou está fora de contexto, mas SEMPRE deve haver pelo menos uma menção classificada.
+
+## CATEGORIAS DE CLASSIFICAÇÃO - ANALISE COM CUIDADO
 
 Classifique cada menção em uma das seguintes categorias:
 
-- **transcrição incorreta**: A palavra "gerente/executivo/representante comercial" foi transcrita incorretamente (ex: "urgente" → "gerente")
-- **fora de contexto**: Refere-se a um gerente que não é o responsável pelo cliente (ex: gerente de loja externa)
-- **direcionando ao gerente**: Atendente orienta cliente a falar com seu gerente para resolver um problema
-- **direcionado à central**: Cliente relata que foi o gerente quem o orientou a ligar na central
-- **reclamação ao gerente**: Cliente faz reclamação direta sobre seu gerente (não sobre problemas que o gerente não causou)
-- **elogio ao gerente**: Cliente faz elogio direto ou dá feedback positivo sobre seu gerente
-- **menção neutra ao gerente**: Menção que não se encaixa em outras categorias
+- **transcrição incorreta**: A palavra "gerente/executivo/representante comercial" foi transcrita incorretamente (ex: "urgente" → "gerente"). Use quando o contexto não faz sentido com a palavra "gerente".
 
-## MOTIVOS DE RECLAMAÇÃO
+- **fora de contexto**: Refere-se a um gerente que não é o responsável pelo cliente no Itaú (ex: gerente de loja externa, gerente de outra empresa).
 
-Para menções classificadas como "reclamação ao gerente", identifique o motivo:
+- **direcionando ao gerente**: Atendente orienta cliente a falar com seu gerente para resolver um problema específico.
 
-- **falta de retorno**: Gerente não responde ou está ausente
-- **demora no retorno**: Gerente demora muito para responder
-- **falta de alçada**: Gerente disse não ter alçada para resolver o problema
-- **orientação inadequada, insuficiente ou confusa**: Gerente deu orientação confusa ou errada
-- **problemas de dados de contato**: Cliente não encontra dados do gerente
-- **promessas não cumpridas**: Gerente prometeu condição comercial e não cumpriu
+- **direcionado à central**: Cliente relata que foi SEU GERENTE DO ITAÚ quem o orientou a ligar na central/atendimento. O gerente deve ter ATIVAMENTE direcionado o cliente.
+
+- **reclamação ao gerente**: Cliente expressa INSATISFAÇÃO DIRETA com seu gerente do Itaú. Deve haver tom de reclamação, não apenas informação neutra. Exemplos: gerente não retorna, demora para responder, deu orientação errada, não cumpriu promessa, não ajudou adequadamente.
+
+- **elogio ao gerente**: Cliente faz elogio direto ou dá feedback positivo sobre seu gerente do Itaú.
+
+- **menção neutra ao gerente**: Cliente apenas menciona o gerente como informação, sem tom de reclamação, elogio ou direcionamento. É uma simples referência informativa.
+
+## CRITÉRIOS ESPECÍFICOS PARA CLASSIFICAÇÃO
+
+### Para "direcionado à central":
+- O GERENTE deve ter ORIENTADO o cliente a ligar
+- Frases como "conversei com o gerente e ele disse que precisa ser tratado com vocês" = direcionado à central
+
+### Para "reclamação ao gerente":
+- Deve haver INSATISFAÇÃO expressa pelo cliente
+- Cliente deve demonstrar frustração, irritação ou crítica ao gerente
+- Simples informações sobre limitações do gerente NÃO são reclamações
+
+### Para "menção neutra":
+- Cliente apenas informa algo relacionado ao gerente
+- Não há tom negativo ou positivo
+- É apenas contexto informativo
+
+## MOTIVOS DE RECLAMAÇÃO - SEJA ESPECÍFICO
+
+Para menções classificadas como "reclamação ao gerente", identifique o motivo correto:
+
+- **falta de retorno**: Cliente tentou contatar o gerente e ele NÃO RESPONDEU ou está ausente
+- **demora no retorno**: Cliente reclama que gerente DEMORA MUITO para responder
+- **falta de alçada**: Gerente disse que não tem poder/autoridade para resolver
+- **orientação inadequada, insuficiente ou confusa**: Gerente deu orientação ERRADA, confusa, insuficiente ou FALHOU em orientar adequadamente (ex: não avisou sobre bloqueio)
+- **problemas de dados de contato**: Cliente não consegue encontrar/acessar dados do gerente
+- **promessas não cumpridas**: Gerente prometeu algo e não cumpriu
 
 ## PROCESSO DE ANÁLISE
 
@@ -39,27 +63,38 @@ Para menções classificadas como "reclamação ao gerente", identifique o motiv
 2. **Identifique corretamente** quem é cliente e quem é atendente
 3. **Localize todas as menções** aos termos "gerente", "executivo", "representante comercial"
 4. **Para cada menção encontrada**:
+   - Analise TODO o contexto da conversa, não apenas frases adjacentes
+   - Identifique o TOM e INTENÇÃO da menção
+   - Determine se há insatisfação, direcionamento, ou apenas informação
    - Extraia a frase completa contendo a menção
-   - Analise o contexto (frases anteriores e posteriores)
    - Reorganize a frase para maior coerência se necessário
-   - Classifique a menção
-   - Forneça justificativa detalhada
-   - Se for reclamação, identifique o motivo específico
+   - Classifique a menção com base nos critérios específicos
+   - Forneça justificativa detalhada baseada no contexto completo
+   - Se for reclamação, identifique o motivo específico correto
 
 ## FORMATO DE RESPOSTA
 
 Responda APENAS com um JSON válido seguindo o schema fornecido. Não inclua texto adicional antes ou depois do JSON.
 
-## EXEMPLO DE RACIOCÍNIO
+## EXEMPLOS DE ANÁLISE
 
-Antes de responder, considere:
-- A palavra transcrita faz sentido no contexto?
-- Quem está falando (cliente ou atendente)?
-- O gerente mencionado é o responsável pelo cliente?
-- Qual é o sentimento/intenção por trás da menção?
-- Se é reclamação, qual é o motivo específico?
+### Exemplo 1: "direcionado à central"
+Cliente: "conversei com a gerente e ela disse que o que eu preciso precisa ser tratado com vocês"
+- Classificação: "direcionado à central" (gerente orientou cliente a falar com central)
 
-Analise a transcrição fornecida e retorne sua análise em formato JSON.
+### Exemplo 2: "reclamação ao gerente" com "falta de retorno"
+Cliente menciona que tentou falar com gerente mas não conseguiu.
+- Classificação: "reclamação ao gerente" com motivo "falta de retorno"
+
+### Exemplo 3: "reclamação ao gerente" com "orientação inadequada"
+Cliente reclama que gerente não o avisou sobre bloqueio.
+- Classificação: "reclamação ao gerente" com motivo "orientação inadequada, insuficiente ou confusa"
+
+### Exemplo 4: "menção neutra"
+Cliente informa que gerente disse que ele não tinha permissão para algo (sem tom de reclamação).
+- Classificação: "menção neutra ao gerente"
+
+Analise a transcrição fornecida e retorne sua análise em formato JSON, garantindo que SEMPRE haja pelo menos uma menção classificada.
 
 TRANSCRIÇÃO PARA ANÁLISE:
 {text}
