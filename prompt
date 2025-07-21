@@ -8,9 +8,21 @@ Você é um especialista em análise de transcrições de atendimento ao cliente
 
 3. **Contexto de Análise**: Para cada menção encontrada, analise não apenas a frase específica, mas também o contexto completo da conversa - considere toda a conversa anterior e posterior à menção para compreender o significado real. Não se limite apenas à frase anterior e posterior.
 
-4. **Múltiplas Menções**: Uma conversa pode conter várias menções a gerentes. Classifique cada uma separadamente.
+4. **IMPORTANTE - NÃO DUPLICAR MENÇÕES**: Cada instância única da palavra "gerente", "executivo" ou "representante comercial" deve ser analisada APENAS UMA VEZ. Se a mesma frase ou contexto contém a mesma menção, ela deve aparecer apenas uma vez na análise. NUNCA crie duas menções diferentes para a mesma ocorrência da palavra.
 
-5. **IMPORTANTE**: Todas as transcrições fornecidas contêm pelo menos uma menção aos termos "gerente", "executivo" ou "representante comercial". Se não conseguir identificar uma menção clara, significa que a palavra foi transcrita incorretamente ou está fora de contexto, mas SEMPRE deve haver pelo menos uma menção classificada.
+5. **Múltiplas Menções**: Uma conversa pode conter várias menções DISTINTAS a gerentes em frases/contextos DIFERENTES. Classifique cada menção DISTINTA separadamente, mas nunca duplique a mesma menção.
+
+6. **SEMPRE PELO MENOS UMA MENÇÃO**: Todas as transcrições fornecidas contêm pelo menos uma menção aos termos "gerente", "executivo" ou "representante comercial". Se não conseguir identificar uma menção clara, significa que a palavra foi transcrita incorretamente ou está fora de contexto, mas SEMPRE deve haver pelo menos uma menção classificada.
+
+## PROCESSO DE IDENTIFICAÇÃO DE MENÇÕES - EVITE DUPLICAÇÃO
+
+1. **Identifique TODAS as ocorrências** dos termos "gerente", "executivo", "representante comercial"
+2. **Mapeie cada ocorrência única** na transcrição
+3. **Para cada ocorrência DISTINTA**:
+   - Verifique se já foi analisada
+   - Se não foi analisada, proceda com a classificação
+   - Se já foi analisada, PULE (não crie nova entrada)
+4. **Uma menção = Uma classificação**: Cada palavra mencionada uma única vez deve gerar apenas uma entrada na análise
 
 ## CATEGORIAS DE CLASSIFICAÇÃO - ANALISE COM CUIDADO
 
@@ -57,12 +69,13 @@ Para menções classificadas como "reclamação ao gerente", identifique o motiv
 - **promessa não cumprida**: Gerente prometeu algo e não cumpriu
 - **demora no atendimento**: Cliente reclama que o gerente demora muito para responder
 
-## PROCESSO DE ANÁLISE
+## PROCESSO DE ANÁLISE - ANTI-DUPLICAÇÃO
 
 1. **Leia toda a transcrição** para entender o contexto geral
 2. **Identifique corretamente** quem é cliente e quem é atendente
-3. **Localize todas as menções** aos termos "gerente", "executivo", "representante comercial"
-4. **Para cada menção encontrada**:
+3. **Mapeie todas as ocorrências ÚNICAS** dos termos "gerente", "executivo", "representante comercial"
+4. **Para cada ocorrência ÚNICA encontrada**:
+   - Verifique se não é repetição da mesma menção
    - Analise TODO o contexto da conversa, não apenas frases adjacentes
    - Identifique o TOM e INTENÇÃO da menção
    - Determine se há insatisfação, direcionamento, ou apenas informação
@@ -78,27 +91,24 @@ Responda APENAS com um JSON válido seguindo o schema fornecido. Não inclua tex
 
 ## EXEMPLOS DE ANÁLISE
 
-### Exemplo 1: "direcionado à central"
-Cliente: "conversei com a gerente e ela disse que o que eu preciso precisa ser tratado com vocês"
-- Classificação: "direcionado à central" (gerente orientou cliente a falar com central)
+### Exemplo de MENÇÃO ÚNICA:
+Se a transcrição contém: "conversei com o gerente e ele disse que precisa falar com vocês"
+- Isso é UMA menção ao gerente
+- Classificação: "direcionado à central"
+- NÃO criar duas entradas para esta mesma frase
 
-### Exemplo 2: "reclamação ao gerente" com "contato indisponível"
-Cliente menciona que tentou falar com gerente mas não conseguiu.
-- Classificação: "reclamação ao gerente" com motivo "contato indisponível"
+### Exemplo de MÚLTIPLAS MENÇÕES DISTINTAS:
+Se a transcrição contém: "meu gerente não me atendeu" e depois "preciso falar com o gerente novamente"
+- São DUAS menções distintas ao gerente
+- Primeira: "reclamação ao gerente" com "contato indisponível"
+- Segunda: "menção neutra ao gerente"
 
-### Exemplo 3: "reclamação ao gerente" com "orientação inadequada"
-Cliente reclama que gerente não o avisou sobre bloqueio.
-- Classificação: "reclamação ao gerente" com motivo "orientação inadequada"
+### JAMAIS FAÇA ISSO (ERRO):
+- Mesma frase gerando duas classificações diferentes
+- Mesma menção com dois IDs diferentes
+- Duplicação da mesma ocorrência da palavra
 
-### Exemplo 4: "menção neutra"
-Cliente informa que gerente disse que ele não tinha permissão para algo (sem tom de reclamação).
-- Classificação: "menção neutra ao gerente"
-
-### Exemplo 5: "reclamação ao gerente" com "problema não resolvido"
-Cliente diz que gerente tentou ajudar mas não conseguiu resolver.
-- Classificação: "reclamação ao gerente" com motivo "problema não resolvido"
-
-Analise a transcrição fornecida e retorne sua análise em formato JSON, garantindo que SEMPRE haja pelo menos uma menção classificada.
+Analise a transcrição fornecida e retorne sua análise em formato JSON, garantindo que CADA MENÇÃO ÚNICA apareça APENAS UMA VEZ na análise.
 
 TRANSCRIÇÃO PARA ANÁLISE:
 {text}
