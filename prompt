@@ -50,12 +50,12 @@ Classifique cada menção em uma das seguintes categorias:
 
 Para menções classificadas como "reclamação ao gerente", identifique o motivo correto:
 
-- **falta de retorno**: Cliente tentou contatar o gerente e ele NÃO RESPONDEU ou está ausente
-- **demora no retorno**: Cliente reclama que gerente DEMORA MUITO para responder
-- **falta de alçada**: Gerente disse que não tem poder/autoridade para resolver
-- **orientação inadequada, insuficiente ou confusa**: Gerente deu orientação ERRADA, confusa, insuficiente ou FALHOU em orientar adequadamente (ex: não avisou sobre bloqueio)
-- **problemas de dados de contato**: Cliente não consegue encontrar/acessar dados do gerente
-- **promessas não cumpridas**: Gerente prometeu algo e não cumpriu
+- **contato indisponível**: Cliente não conseguiu contatar o gerente (não atende, não responde, está ausente)
+- **dados de contato inexistentes**: Cliente não conseguiu encontrar os dados do gerente para contatá-lo
+- **problema não resolvido**: Cliente falou com o gerente, porém ele não conseguiu resolver o problema
+- **orientação inadequada**: Gerente não deu orientação adequada ou falhou em dar orientação/aviso sobre algo
+- **promessa não cumprida**: Gerente prometeu algo e não cumpriu
+- **demora no atendimento**: Cliente reclama que o gerente demora muito para responder
 
 ## PROCESSO DE ANÁLISE
 
@@ -82,17 +82,21 @@ Responda APENAS com um JSON válido seguindo o schema fornecido. Não inclua tex
 Cliente: "conversei com a gerente e ela disse que o que eu preciso precisa ser tratado com vocês"
 - Classificação: "direcionado à central" (gerente orientou cliente a falar com central)
 
-### Exemplo 2: "reclamação ao gerente" com "falta de retorno"
+### Exemplo 2: "reclamação ao gerente" com "contato indisponível"
 Cliente menciona que tentou falar com gerente mas não conseguiu.
-- Classificação: "reclamação ao gerente" com motivo "falta de retorno"
+- Classificação: "reclamação ao gerente" com motivo "contato indisponível"
 
 ### Exemplo 3: "reclamação ao gerente" com "orientação inadequada"
 Cliente reclama que gerente não o avisou sobre bloqueio.
-- Classificação: "reclamação ao gerente" com motivo "orientação inadequada, insuficiente ou confusa"
+- Classificação: "reclamação ao gerente" com motivo "orientação inadequada"
 
 ### Exemplo 4: "menção neutra"
 Cliente informa que gerente disse que ele não tinha permissão para algo (sem tom de reclamação).
 - Classificação: "menção neutra ao gerente"
+
+### Exemplo 5: "reclamação ao gerente" com "problema não resolvido"
+Cliente diz que gerente tentou ajudar mas não conseguiu resolver.
+- Classificação: "reclamação ao gerente" com motivo "problema não resolvido"
 
 Analise a transcrição fornecida e retorne sua análise em formato JSON, garantindo que SEMPRE haja pelo menos uma menção classificada.
 
