@@ -24,7 +24,6 @@ DEFAULT_MAX_RETRY = 3
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_MAX_TPM = 1500000
 DEFAULT_INITIAL_CONCURRENCY = 30
-# Timeout removido - será capturado dinamicamente da API
 
 
 @dataclass
@@ -123,12 +122,28 @@ class AIProcessor:
         
     def _get_model_pricing(self, model: str) -> Dict[str, float]:
         model_data = self.models_config.get(model, {})
-        return {'input': model_data.get('input', 0.0), 'output': model_data.get('output', 0.0), 'cache': model_data.get('cache', 0.0)}
+        return {
+            'input': model_data.get('input', 0.0), 
+            'output': model_data.get('output', 0.0), 
+            'cache': model_data.get('cache', 0.0)
+        }
 
     def _calculate_cost(self, model: str, input_tokens: int, output_tokens: int = 0, cached_tokens: int = 0) -> float:
+        """
+        Calcula o custo baseado em pricing POR MILHÃO de tokens.
+        CORREÇÃO: Divisor alterado de 1000 para 1000000.
+        """
         pricing = self._get_model_pricing(model)
         regular_input = max(0, input_tokens - cached_tokens)
-        return ((regular_input / 1000) * pricing['input'] + (cached_tokens / 1000) * pricing['cache'] + (output_tokens / 1000) * pricing['output'])
+        
+        # CORREÇÃO: Divisão por 1,000,000 (um milhão) em vez de 1,000
+        cost = (
+            (regular_input / 1000000) * pricing['input'] + 
+            (cached_tokens / 1000000) * pricing['cache'] + 
+            (output_tokens / 1000000) * pricing['output']
+        )
+        
+        return cost
 
     def _supports_json_schema(self, model: str) -> bool:
         return self.models_config.get(model, {}).get('json_schema', False)
@@ -166,14 +181,12 @@ class AIProcessor:
         error_message = str(exception).lower()
         error_type = type(exception).__name__.lower()
         
-        # Padrões de timeout da API (não nosso timeout local)
         api_timeout_patterns = [
             'timeout', 'timed out', 'request timeout',
             'gateway timeout', 'upstream timeout',
             'read timeout', 'connection timeout'
         ]
         
-        # Verifica se é timeout da API ou erro de rede com timeout
         return any(pattern in error_message for pattern in api_timeout_patterns)
 
     def _extract_wait_time_from_error(self, result: Dict[str, Any]) -> float:
@@ -220,10 +233,45 @@ class AIProcessor:
         dt_object = datetime.fromtimestamp(now, tz=BR_TIMEZONE)
         return dt_object.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
 
+    def _extract_cached_tokens(self, response) -> int:
+        """
+        Extrai cached tokens da resposta da API de forma robusta.
+        CORREÇÃO: Acesso mais seguro aos campos aninhados da resposta.
+        """
+        try:
+            # Tenta acessar usage.prompt_tokens_details.cached_tokens
+            if hasattr(response, 'usage') and response.usage:
+                usage = response.usage
+                
+                # Verifica se tem prompt_tokens_details
+                if hasattr(usage, 'prompt_tokens_details') and usage.prompt_tokens_details:
+                    prompt_details = usage.prompt_tokens_details
+                    
+                    # Verifica se tem cached_tokens
+                    if hasattr(prompt_details, 'cached_tokens') and prompt_details.cached_tokens is not None:
+                        cached_tokens = prompt_details.cached_tokens
+                        logger.debug(f"Cached tokens extraídos: {cached_tokens}")
+                        return cached_tokens
+                    
+                # Tenta acesso alternativo como dicionário
+                elif isinstance(usage.prompt_tokens_details, dict):
+                    cached_tokens = usage.prompt_tokens_details.get('cached_tokens', 0)
+                    if cached_tokens > 0:
+                        logger.debug(f"Cached tokens extraídos (dict): {cached_tokens}")
+                    return cached_tokens
+                    
+            # Log para debugging quando não encontra cached tokens
+            logger.debug("Nenhum cached token encontrado na resposta")
+            return 0
+            
+        except Exception as e:
+            logger.warning(f"Erro ao extrair cached tokens: {e}")
+            return 0
+
     async def _make_api_call(self, params: Dict[str, Any], request_id: str, batch_id: Optional[str] = None, is_embedding: bool = False) -> Dict[str, Any]:
         """
         Faz chamada à API com tratamento robusto que NUNCA interrompe o lote.
-        Todos os erros são capturados e retornados como resultados de falha.
+        CORREÇÕES: JSON Schema format e extração de cached tokens melhoradas.
         """
         model = params.get('model', self.config.model if not is_embedding else self.config.embedding_model)
         
@@ -246,14 +294,19 @@ class AIProcessor:
                         # Processa resposta de sucesso
                         if is_embedding:
                             content = response.data[0].embedding if isinstance(params.get("input"), str) else [emb.embedding for emb in response.data]
-                            input_tokens, output_tokens, cached_tokens = response.usage.prompt_tokens, 0, 0
+                            input_tokens, output_tokens = response.usage.prompt_tokens, 0
+                            cached_tokens = 0  # Embeddings não usam cache
                         else:
                             content = response.choices[0].message.content
                             if params.get('response_format') and content:
-                                try: content = json.loads(content)
-                                except json.JSONDecodeError: pass
+                                try: 
+                                    content = json.loads(content)
+                                except json.JSONDecodeError: 
+                                    pass
+                            
                             input_tokens, output_tokens = response.usage.prompt_tokens, response.usage.completion_tokens
-                            cached_tokens = getattr(getattr(response.usage, 'prompt_tokens_details', {}), 'cached_tokens', 0)
+                            # CORREÇÃO: Extração melhorada de cached tokens
+                            cached_tokens = self._extract_cached_tokens(response)
                         
                         return {
                             'id': request_id, 'success': True, 'content': content, 'model': model,
@@ -317,7 +370,6 @@ class AIProcessor:
                         
         except RetryError as retry_error:
             # CRÍTICO: Captura RetryError e converte em resultado de falha
-            # Isso evita que o lote seja interrompido
             last_exception = retry_error.last_attempt.exception()
             api_response_time = time.time() - start_time if 'start_time' in locals() else 0.0
             
@@ -339,7 +391,6 @@ class AIProcessor:
         
         except Exception as unexpected_error:
             # CRÍTICO: Captura qualquer exceção não prevista
-            # Garante que o lote continue mesmo com erros inesperados
             logger.error(f"🚨 Erro inesperado para {request_id}: {type(unexpected_error).__name__} - {str(unexpected_error)}")
             logger.error(f"🔍 Traceback: {traceback.format_exc()}")
             
@@ -392,10 +443,8 @@ class AIProcessor:
     async def _run_batch_processor(self, worker_coro: Callable, items: List, **kwargs):
         """
         Executa o processamento em lote com garantia de conclusão.
-        Usa gather com return_exceptions=True para não falhar em exceções individuais.
         """
         tasks = [asyncio.create_task(worker_coro(item, **kwargs)) for item in items]
-        # CRÍTICO: return_exceptions=True evita que uma exceção pare todo o lote
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Processa resultados e converte exceções em resultados de falha
@@ -441,7 +490,7 @@ class AIProcessor:
         summary = (
             f"✅ Lote '{batch_id}' CONCLUÍDO (100% processado). "
             f"Duração: {batch_stats.processing_time:.2f}s | "
-            f"Custo: ${batch_stats.total_cost:.4f} | "
+            f"Custo: ${batch_stats.total_cost:.6f} | "  # Mais decimais para custos baixos
             f"Tokens: {batch_stats.total_tokens:,} | "
             f"Sucesso: {batch_stats.successful_requests}/{batch_stats.total_requests}"
         )
@@ -458,7 +507,7 @@ class AIProcessor:
         extra_log = {
             'action': 'batch_complete', 'batch_id': batch_id,
             'processing_time': round(batch_stats.processing_time, 2),
-            'total_cost': round(batch_stats.total_cost, 4),
+            'total_cost': round(batch_stats.total_cost, 6),  # Mais precisão
             'total_requests': batch_stats.total_requests,
             'successful_requests': batch_stats.successful_requests,
             'failed_requests': failed_requests,
@@ -524,9 +573,21 @@ class AIProcessor:
         try:
             prompt = prompt_template.format(text=text, **kwargs)
             api_model = model or self.config.model
-            params = {"model": api_model, "messages": [{"role": "user", "content": prompt}], "temperature": self.config.temperature}
-            if self.config.max_tokens: params["max_tokens"] = self.config.max_tokens
-            if json_schema: params["response_format"] = {"type": "json_object"}
+            params = {
+                "model": api_model, 
+                "messages": [{"role": "user", "content": prompt}], 
+                "temperature": self.config.temperature
+            }
+            
+            if self.config.max_tokens: 
+                params["max_tokens"] = self.config.max_tokens
+                
+            # CORREÇÃO: Formato correto para JSON Schema
+            if json_schema:
+                params["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": json_schema
+                }
             
             result = await self._make_api_call(params, request_id, batch_id)
             
