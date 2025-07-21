@@ -94,12 +94,12 @@
             "motivo_reclamacao": {
               "type": ["string", "null"],
               "enum": [
-                "falta de retorno",
-                "demora no retorno",
-                "falta de alçada",
-                "orientação inadequada, insuficiente ou confusa",
-                "problemas de dados de contato",
-                "promessas não cumpridas",
+                "contato indisponível",
+                "dados de contato inexistentes",
+                "problema não resolvido",
+                "orientação inadequada",
+                "promessa não cumprida",
+                "demora no atendimento",
                 null
               ],
               "description": "Motivo específico da reclamação (apenas para classificação 'reclamação ao gerente')"
