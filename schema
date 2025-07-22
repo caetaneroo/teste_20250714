@@ -83,6 +83,8 @@
                 "direcionado à central",
                 "reclamação ao gerente",
                 "elogio ao gerente",
+                "dados de contato indisponíveis",
+                "insatisfação com modelo de atendimento",
                 "menção neutra ao gerente"
               ],
               "description": "Classificação da menção"
@@ -95,12 +97,12 @@
               "type": ["string", "null"],
               "enum": [
                 "contato malsucedido",
-                "dados de contato indisponíveis",
                 "problema não resolvido",
                 "orientação inadequada",
                 "condições comerciais não cumpridas",
                 "falta de retorno prometido",
                 "demora na resposta",
+                "comportamento grosseiro",
                 null
               ],
               "description": "Motivo específico da reclamação (apenas para classificação 'reclamação ao gerente')"
