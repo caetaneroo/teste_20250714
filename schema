@@ -13,7 +13,7 @@
           },
           "total_mencoes": {
             "type": "integer",
-            "description": "Número total de menções encontradas"
+            "description": "Número total de menções ÚNICAS encontradas"
           },
           "papeis_identificados": {
             "type": "object",
@@ -47,7 +47,7 @@
           "properties": {
             "id_mencao": {
               "type": "integer",
-              "description": "ID sequencial da menção"
+              "description": "ID sequencial da menção ÚNICA"
             },
             "termo_encontrado": {
               "type": "string",
@@ -94,12 +94,13 @@
             "motivo_reclamacao": {
               "type": ["string", "null"],
               "enum": [
-                "contato indisponível",
-                "dados de contato inexistentes",
+                "contato malsucedido",
+                "dados de contato indisponíveis",
                 "problema não resolvido",
                 "orientação inadequada",
-                "promessa não cumprida",
-                "demora no atendimento",
+                "condições comerciais não cumpridas",
+                "falta de retorno prometido",
+                "demora na resposta",
                 null
               ],
               "description": "Motivo específico da reclamação (apenas para classificação 'reclamação ao gerente')"
