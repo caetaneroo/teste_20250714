@@ -62,12 +62,56 @@ Classifique cada menção em uma das seguintes categorias:
 
 Para menções classificadas como "reclamação ao gerente", identifique o motivo correto:
 
-- **contato indisponível**: Cliente não conseguiu contatar o gerente (não atende, não responde, está ausente)
-- **dados de contato inexistentes**: Cliente não conseguiu encontrar os dados do gerente para contatá-lo
+- **contato malsucedido**: Cliente tentou contatar o gerente mas não obteve sucesso (não atende, não responde ou está ausente)
+
+- **dados de contato indisponíveis**: Cliente não conseguiu encontrar ou acessar os dados do gerente para contatá-lo
+
 - **problema não resolvido**: Cliente falou com o gerente, porém ele não conseguiu resolver o problema
-- **orientação inadequada**: Gerente não deu orientação adequada ou falhou em dar orientação/aviso sobre algo
-- **promessa não cumprida**: Gerente prometeu algo e não cumpriu
-- **demora no atendimento**: Cliente reclama que o gerente demora muito para responder
+
+- **orientação inadequada**: Gerente deu informações erradas, incompletas ou falhou em orientar o cliente. Associado à má qualidade da orientação
+
+- **condições comerciais não cumpridas**: Gerente acordou condições comerciais específicas (taxas, tarifas, condições de crédito/cobrança) e o cliente reclama que não estão sendo cumpridas
+
+- **falta de retorno prometido**: Gerente se comprometeu a enviar algum arquivo ou retornar alguma resposta para o cliente e não o fez
+
+- **demora na resposta**: Cliente conseguiu contato com o gerente, mas a resposta foi lenta
+
+## EXEMPLOS DOS MOTIVOS DE RECLAMAÇÃO
+
+### contato malsucedido:
+- "Tentei ligar pro meu gerente mas ele não atende"
+- "Meu gerente está sempre ocupado, nunca consigo falar com ele"
+- "Já tentei várias vezes mas meu gerente não responde"
+
+### dados de contato indisponíveis:
+- "Não tenho o telefone do meu gerente"
+- "Não sei como entrar em contato com meu gerente"
+- "Perdi o cartão do gerente e não consigo encontrar os dados dele"
+
+### problema não resolvido:
+- "Conversei com meu gerente mas ele não conseguiu me ajudar"
+- "Meu gerente tentou mas não resolveu minha situação"
+- "O gerente disse que não pode fazer nada pelo meu caso"
+
+### orientação inadequada:
+- "Meu gerente me deu uma informação errada sobre o limite"
+- "O gerente me orientou mal sobre o produto"
+- "Meu gerente não me explicou direito como funciona"
+
+### condições comerciais não cumpridas:
+- "O gerente prometeu uma taxa especial e não liberou"
+- "A gerente disse que não haveria cobrança dessa taxa, mas está sendo cobrada"
+- "Meu gerente acordou um limite maior e não foi aplicado"
+
+### falta de retorno prometido:
+- "O gerente disse que ia me enviar o contrato e nunca mandou"
+- "Prometeu que ia me ligar com a resposta e nunca ligou"
+- "Disse que ia verificar e me retornar, mas não retornou"
+
+### demora na resposta:
+- "Falei com meu gerente mas ele demora uma semana para responder"
+- "Consegui falar com o gerente, mas ele demora muito para dar retorno"
+- "O gerente me respondeu, mas depois de 10 dias"
 
 ## PROCESSO DE ANÁLISE - ANTI-DUPLICAÇÃO
 
@@ -100,7 +144,7 @@ Se a transcrição contém: "conversei com o gerente e ele disse que precisa fal
 ### Exemplo de MÚLTIPLAS MENÇÕES DISTINTAS:
 Se a transcrição contém: "meu gerente não me atendeu" e depois "preciso falar com o gerente novamente"
 - São DUAS menções distintas ao gerente
-- Primeira: "reclamação ao gerente" com "contato indisponível"
+- Primeira: "reclamação ao gerente" com "contato malsucedido"
 - Segunda: "menção neutra ao gerente"
 
 ### JAMAIS FAÇA ISSO (ERRO):
